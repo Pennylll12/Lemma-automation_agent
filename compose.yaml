@@ -1,0 +1,26 @@
+services:
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/flow.db
+      EMBEDDED_WORKER: 'false'
+    ports:
+      - '127.0.0.1:8000:8000'
+    volumes:
+      - flow-data:/app/data
+    restart: unless-stopped
+  worker:
+    build: .
+    command: python -m backend.app worker
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/flow.db
+      EMBEDDED_WORKER: 'false'
+    volumes:
+      - flow-data:/app/data
+    depends_on:
+      - api
+    restart: unless-stopped
+volumes:
+  flow-data:

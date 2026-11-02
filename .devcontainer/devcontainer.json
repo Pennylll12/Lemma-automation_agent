@@ -1,0 +1,32 @@
+{
+  "name": "SuperMama Flow Lab (Python 3.12)",
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "24"
+    }
+  },
+  "forwardPorts": [
+    8000
+  ],
+  "portsAttributes": {
+    "8000": {
+      "label": "SuperMama Flow Lab",
+      "onAutoForward": "notify"
+    }
+  },
+  "containerEnv": {
+    "AI_PROVIDER": "mock",
+    "LIVE_SEND_ENABLED": "false",
+    "EMBEDDED_WORKER": "false",
+    "DATABASE_PATH": "data/flow.db"
+  },
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python"
+      }
+    }
+  }
+}
