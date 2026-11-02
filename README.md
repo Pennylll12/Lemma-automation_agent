@@ -12,6 +12,8 @@
 - SleekFlow 發送 URL、認證 header 及 body schema 尚未完成官方端點核對。提供可配置 HTTP adapter，只有核實後配置及啟用才可以實測發送。未作任何真實外部 API 端到端測試。
 - 僅基本遮蓋常見香港電話、電郵、部分姓名及門牌。這不是完整匿名化或 DLP；請只用虛構資料測試。
 
+本次匯入及本機／Codespaces 實測結果見 [VALIDATION.md](VALIDATION.md)。
+
 ## GitHub Codespaces（Python 3.12）
 
 [開啟 Codespaces](https://codespaces.new/Pennylll12/Lemma-automation_agent)，選 `main`，使用本 repository 的 devcontainer。建立後會安裝 `requirements-lock.txt`、執行 pytest 及 JavaScript 語法檢查；不自動啟動 API 或 Worker。Node 24 僅供 JavaScript 檢查，Python 服務本身不依賴 Node。
