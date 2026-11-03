@@ -213,7 +213,7 @@ async def answer(j):
             except (ValueError, TypeError, AttributeError):
                 pass  # Fixed safe greeting; never render unvalidated model text.
             actual_provider = 'deepseek'
-        reply = opening + '\n' + calendar.render_result(result)
+        reply = opening + '\n' + calendar.render_customer_reply(result)
         update_job(j, provider=actual_provider, intent='inspection', reply=reply, stage=3)
         with db() as c:
             event(c, j['id'], 'calendar_checked', 'Google日曆查詢完成；候選時段未建立預約' if result['source'] == 'google' else '資料不足；未查Google日曆，請先確認查詢條件')

@@ -313,3 +313,28 @@ def test_concurrent_startup_migration(tmp_path, monkeypatch):
     with m.db() as db:
         names=[r['name'] for r in db.execute('PRAGMA table_info(jobs)')]
         assert names.count('schedule')==names.count('calendar_result')==1
+
+
+def test_customer_reply_is_short_verified_and_separate_from_internal_notes(busy):
+    data = result(include_weekday_evening=True)
+    reply = cal.render_customer_reply(data)
+    assert reply.count('・') == 3  # Four verified alternatives, at most three offered.
+    assert '11月3日（星期二）09:00–12:00' in reply
+    assert '18:00–21:00' not in reply
+    assert '飯' not in reply and '交通' not in reply and 'Google' not in reply
+    assert '確認後先落實預約' in reply
+    assert '交通' in cal.render_result(data)  # Evidence retained for operators.
+    assert len(data['slots']) == 4
+
+
+def test_no_slots_reply_does_not_offer_unverified_alternatives(busy):
+    busy.append((dt('2026-11-03T00:00:00'),dt('2026-11-04T00:00:00')))
+    reply = cal.render_customer_reply(result())
+    assert '未搵到合適' in reply and '邊幾日方便' in reply
+    assert '09:00' not in reply
+
+
+def test_completion_only_customer_reply_asks_pickup_without_claiming_lookup(busy):
+    reply = cal.render_customer_reply(result(completion_date='2026-11-03'))
+    assert '10個工作天' in reply and '幾點領匙' in reply
+    assert '查過' not in reply

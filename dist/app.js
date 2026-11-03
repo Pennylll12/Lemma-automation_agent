@@ -30,7 +30,7 @@ function render(){
  $('allRows').innerHTML=filtered.map(row).join('')||'<tr><td colspan="5" class="emptyrow">未有符合條件嘅任務。</td></tr>';bindRows();
  const j=jobs.find(x=>x.id===selected);const stage=j?.stage||0;
  $('pipeline').innerHTML=['接收訊息','背景排隊','AI 處理','準備回覆'].map((s,i)=>`<div class="step ${stage>i?'complete':stage===i&&j?'current':''}"><i>${stage>i?'✓':i+1}</i>${s}</div>`).join('');
- if(j){$('resultArea').innerHTML=`<div class="resulttop"><span>${esc(j.id.slice(0,28))}</span><span class="status ${esc(j.status)}">${esc(labels[j.status]||j.status)}</span></div>${j.reply?`<div class="replycard"><div class="replytitle"><b>✦ ${j.provider==='deepseek'?'DeepSeek 回答':j.calendar_result?'日曆規則回答':'規則模擬回答'}</b><span>${j.mode==='test'?'測試入口':'Webhook'}</span></div><p>${esc(j.reply)}</p><small>${j.status==='accepted'?'API 已接受，尚未驗證 WhatsApp 送達':'未宣告 WhatsApp 送達；請以任務狀態為準。'}</small></div>`:''}${j.calendar_result?`<div class="calendar-source">${esc(j.calendar_result.source==='google'?'來源：Google Calendar 真實查詢快照，候選未落實':'來源：規則提示，未查Google日曆')}</div>`:''}${j.error?`<div class="errorbox">${esc(j.error)}</div>`:''}<div class="eventlist">${(j.events||[]).map(e=>`<div class="event"><time>${clock(e.at)}</time><span>${esc(e.detail)}</span></div>`).join('')}</div><div class="resultactions">${j.status==='failed'?'<button class="button secondary" id="retryBtn">↻ 重試任務</button>':''}${j.mode==='test'?'<button class="textbtn" id="duplicateBtn">重送同一事件（測試去重）</button>':''}</div>`;
+ if(j){$('resultArea').innerHTML=`<div class="resulttop"><span>${esc(j.id.slice(0,28))}</span><span class="status ${esc(j.status)}">${esc(labels[j.status]||j.status)}</span></div>${j.reply?`<div class="replycard"><div class="replytitle"><b>✦ ${j.calendar_result?'建議客人回覆':j.provider==='deepseek'?'DeepSeek 回答':'規則模擬回答'}</b><span>${j.mode==='test'?'測試入口':'Webhook'}</span></div><p>${esc(j.reply)}</p><small>${j.status==='accepted'?'API 已接受，尚未驗證 WhatsApp 送達':'未宣告 WhatsApp 送達；請以任務狀態為準。'}</small></div>`:''}${j.calendar_result?`<div class="calendar-source">${esc(j.calendar_result.source==='google'?'來源：Google Calendar 真實查詢快照，候選未落實':'來源：規則提示，未查Google日曆')}</div>`:''}${j.calendar_result?calendarInternal(j.calendar_result):''}${j.error?`<div class="errorbox">${esc(j.error)}</div>`:''}<div class="eventlist">${(j.events||[]).map(e=>`<div class="event"><time>${clock(e.at)}</time><span>${esc(e.detail)}</span></div>`).join('')}</div><div class="resultactions">${j.status==='failed'?'<button class="button secondary" id="retryBtn">↻ 重試任務</button>':''}${j.mode==='test'?'<button class="textbtn" id="duplicateBtn">重送同一事件（測試去重）</button>':''}</div>`;
  if($('retryBtn'))$('retryBtn').onclick=()=>retry(j);if($('duplicateBtn'))$('duplicateBtn').onclick=()=>duplicate(j);
  }
  const contact=$('contact').value;const held=api?jobs.some(j=>j.contact_id===contact&&j.human):!!human[contact];$('contactState').textContent=held?'人工已接管 · AI 暫停':'AI 可處理';$('takeoverBtn').textContent=held?'恢復 AI':'人工接管';$('contactDot').style.background=held?'#b99a53':'#3d9c73';
@@ -77,3 +77,9 @@ $('calendarQueryBtn').onclick=async()=>{
  }catch(e){target.textContent='查詢未完成：'+e.message+'；沒有使用固定空位替代。'}
  finally{$('calendarQueryBtn').disabled=false}
 };
+
+// Operational details are separate from the customer reply preview.
+function calendarInternal(data){
+ const slots=(data.slots||[]).map(s=>`<li>${esc(s.start.slice(0,10))} ${esc(s.start.slice(11,16))}–${esc(s.end.slice(11,16))} · ${esc(s.reason)}${s.evening?' · 晚場':''}</li>`).join('');
+ return `<details class="calendarform"><summary>內部核對：日曆結果與安排提醒</summary><p>${esc(data.summary)}</p>${data.checked_at?`<p>查詢快照：${esc(data.checked_at)} · 香港時間</p>`:''}<ol>${slots}</ol><p>${(data.notes||[]).map(esc).join('<br>')}</p><p>登記紀錄尚未核對，未建立或保留預約；以下候選為替代選項。</p></details>`;
+}

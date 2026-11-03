@@ -1,5 +1,10 @@
 # 匯入驗證紀錄 — 2026-11-02
 
+## 客人回覆調整 — 2026-11-03
+
+- 54項pytest通過、JavaScript語法及diff格式檢查通過。新增回覆測試：最多三個已查證候選、內部提醒分離、無空位不捏造、只有成交日先追問領匙。
+- 保留完整calendar_result及人工核對提示。未呼叫真實Google或DeepSeek、未發送WhatsApp。
+
 ## Google Calendar 增量驗證 — 2026-11-03
 
 - 本機 Python 3.12：51項pytest通過；依賴檢查、JavaScript語法及git diff格式檢查通過。保留原有Starlette TestClient棄用警告。

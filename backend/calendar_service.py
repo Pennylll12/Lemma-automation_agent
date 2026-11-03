@@ -226,6 +226,25 @@ async def lookup(request: AvailabilityRequest):
             'notes': notes}
 
 
+def render_customer_reply(result):
+    """Customer copy uses only verified slots; operational notes stay in the UI."""
+    if result['status'] == 'needs_details':
+        if result.get('source') == 'rules' and '只有成交日期' in result['summary']:
+            return ('收到！成交後最快第二個工作天可以拎律師信，再打電話去管理處約領匙，一般可約兩個工作天後。'
+                    '\n成交日起計10個工作天內或之前可以領匙，實際日期要同律師樓及管理處確認。'
+                    '\n你約咗邊日、幾點領匙呀？確認後我再幫你查驗樓時間，會優先睇領匙當日或週末。')
+        return '請先確認領匙日期、時間，同埋想邊日驗樓呀？有齊資料，我再幫你查合適時段。'
+    if not result['slots']:
+        return '幫你查過喇，今次查詢範圍暫時未搵到合適嘅驗樓時段。你仲有邊幾日方便？我再幫你睇吓。'
+    lines = ['幫你查過喇，可以先考慮以下驗樓時段：']
+    for slot in result['slots'][:3]:
+        start, end = parse_datetime(slot['start']), parse_datetime(slot['end'])
+        weekday = '一二三四五六日'[start.weekday()]
+        lines.append(f'・{start.month}月{start.day}日（星期{weekday}）{start:%H:%M}–{end:%H:%M}')
+    lines.extend(['你比較方便邊個時段呀？我哋再核實安排，確認後先落實預約。'])
+    return '\n'.join(lines)
+
+
 def render_result(result):
     lines = [result['summary']]
     for index, slot in enumerate(result['slots'], 1):
