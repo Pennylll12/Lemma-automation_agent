@@ -1,0 +1,238 @@
+"""Read-only Google FreeBusy adapter and deterministic inspection candidates.
+
+No event titles, descriptions, attendee data or write scopes are requested.
+Candidates are not reservations; staffing, travel and meals still need review.
+"""
+import asyncio
+import json
+import os
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from typing import Literal
+from zoneinfo import ZoneInfo
+
+import httpx
+from pydantic import BaseModel, Field, field_validator
+
+HK = ZoneInfo('Asia/Hong_Kong')
+STARTS = ('09:00', '12:30', '15:45', '18:00')
+SCOPE = 'https://www.googleapis.com/auth/calendar.freebusy'
+
+
+class CalendarError(Exception):
+    """Safe, user-facing error. Never include provider bodies or credentials."""
+
+
+class AvailabilityRequest(BaseModel):
+    start_date: date
+    days: int = Field(default=7, ge=1, le=14)
+    duration_minutes: Literal[120, 150, 180] = 180
+    pickup_at: datetime | None = None
+    completion_date: date | None = None
+    preference: Literal['any', 'morning', 'afternoon'] = 'any'
+    include_weekday_evening: bool = False
+
+    @field_validator('pickup_at')
+    @classmethod
+    def aware_pickup(cls, value):
+        if value and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError('領匙時間必須包含時區')
+        return value.astimezone(HK) if value else None
+
+
+def now_hk():
+    return datetime.now(HK)
+
+
+def mode():
+    return os.getenv('CALENDAR_MODE', 'mock').lower()
+
+
+def calendar_id():
+    return os.getenv('GOOGLE_CALENDAR_ID', 'lemma@supermama.homes')
+
+
+def safe_config():
+    return {
+        'mode': mode(), 'calendar_id': calendar_id(), 'timezone': 'Asia/Hong_Kong',
+        'credentials_configured': bool(os.getenv('GOOGLE_APPLICATION_CREDENTIALS') or os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')),
+        'read_only': True, 'starts': list(STARTS),
+        'status': '未驗證連線' if mode() == 'google' else '固定測試資料',
+    }
+
+
+def access_token():
+    # Lazy imports keep mock-only installations usable during an update.
+    from google.auth.transport.requests import Request
+    from google.oauth2 import service_account
+    try:
+        raw = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+        path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+        if raw:
+            info = json.loads(raw)
+        elif path:
+            info = json.loads(Path(path).read_text())
+        else:
+            raise CalendarError('未配置Google憑證；請設定GOOGLE_APPLICATION_CREDENTIALS或GOOGLE_SERVICE_ACCOUNT_JSON。')
+        # Do not allow a credential file to redirect the signing assertion elsewhere.
+        if info.get('type') != 'service_account' or info.get('token_uri') != 'https://oauth2.googleapis.com/token':
+            raise CalendarError('Google憑證格式不正確，請使用官方Service Account JSON。')
+        credentials = service_account.Credentials.from_service_account_info(info, scopes=[SCOPE])
+        transport = Request()
+        def bounded_request(*args, **kwargs):
+            kwargs['timeout'] = 15
+            return transport(*args, **kwargs)
+        credentials.refresh(bounded_request)
+        return credentials.token
+    except CalendarError:
+        raise
+    except Exception:
+        raise CalendarError('Google憑證載入或授權失敗；請檢查檔案、金鑰及網絡，勿貼出私鑰。') from None
+
+
+def parse_datetime(value):
+    parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        raise ValueError('Missing timezone')
+    return parsed.astimezone(HK)
+
+
+async def fetch_busy(start, end):
+    if mode() != 'google':
+        raise CalendarError('尚未啟用Google日曆模式；固定測試資料不能當作真實空位。')
+    try:
+        token = await asyncio.wait_for(asyncio.to_thread(access_token), timeout=20)
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                'https://www.googleapis.com/calendar/v3/freeBusy',
+                headers={'Authorization': 'Bearer ' + token},
+                json={'timeMin': start.isoformat(), 'timeMax': end.isoformat(),
+                      'timeZone': 'Asia/Hong_Kong', 'items': [{'id': calendar_id()}]},
+            )
+        if response.status_code != 200:
+            code = response.status_code
+            raise CalendarError(f'Google日曆查詢失敗（HTTP {code}）；請檢查Calendar API、分享權限、配額及網絡。')
+        body = response.json()
+        entry = body.get('calendars', {}).get(calendar_id())
+        if not isinstance(entry, dict) or entry.get('errors') or not isinstance(entry.get('busy'), list):
+            raise CalendarError('Google未回傳完整日曆資料；請確認指定日曆已分享給Service Account。')
+        busy = []
+        for item in entry['busy']:
+            a, b = parse_datetime(item['start']), parse_datetime(item['end'])
+            if b <= a:
+                raise ValueError('Invalid busy interval')
+            busy.append((a, b))
+        return busy
+    except CalendarError:
+        raise
+    except Exception:
+        raise CalendarError('Google日曆回應不完整或連線失敗；未提供任何替代空位。') from None
+
+
+def conflicts(start, end, intervals):
+    # Google busy end is exclusive: touching boundaries alone do not overlap.
+    return any(start < b and end > a for a, b in intervals)
+
+
+def meal_breaks(day):
+    intervals = []
+    value = os.getenv('CALENDAR_MEAL_BREAKS', '').strip()
+    for interval in value.split(',') if value else []:
+        a, b = interval.strip().split('-')
+        start = datetime.combine(day, time.fromisoformat(a), HK)
+        end = datetime.combine(day, time.fromisoformat(b), HK)
+        if not 30 <= (end - start).total_seconds()/60 <= 50:
+            raise ValueError('Meal duration must be 30–50 minutes')
+        intervals.append((start, end))
+    if value and len(intervals) != 2:
+        raise ValueError('Configure both lunch and dinner')
+    return intervals
+
+
+def travel_minutes():
+    value = os.getenv('CALENDAR_TRAVEL_MINUTES', '').strip()
+    if not value:
+        return None
+    minutes = int(value)
+    if not 0 <= minutes <= 180:
+        raise ValueError('Invalid travel buffer')
+    return minutes
+
+
+async def lookup(request: AvailabilityRequest):
+    current = now_hk()
+    if request.start_date < current.date() or request.start_date > current.date() + timedelta(days=366):
+        raise CalendarError('請選擇今天起一年內的查詢開始日期。')
+    if request.completion_date and not request.pickup_at:
+        return {
+            'status': 'needs_details', 'source': 'rules', 'slots': [], 'requires_review': True,
+            'summary': '只有成交日期，請先確認實際領匙日期及時間，再查驗樓空位。',
+            'notes': ['成交後最快第二個工作天可領律師信，再致電管理處；一般可約兩個工作天後領匙。',
+                      '成交日起計10個工作天內或之前可領匙；星期六、假期及起算方式未定案，不自動計算最後領匙日。',
+                      '星期日不建議領匙；優先安排領匙當日或之後週末驗樓。'],
+        }
+    if request.pickup_at and request.completion_date and request.pickup_at.date() < request.completion_date:
+        return {'status': 'needs_details', 'source': 'rules', 'slots': [], 'requires_review': True,
+                'summary': '領匙時間早於成交日期，請先確認兩個日期，未查詢日曆。', 'notes': []}
+    if request.pickup_at and request.pickup_at.weekday() == 6:
+        return {'status': 'needs_details', 'source': 'rules', 'slots': [], 'requires_review': True,
+                'summary': '領匙日期為星期日，與目前管理處規則不符，請先人工確認領匙安排。', 'notes': []}
+    start = datetime.combine(request.start_date, time.min, HK)
+    end = start + timedelta(days=request.days)
+    try:
+        travel = travel_minutes()
+        for offset in range(request.days):
+            meal_breaks(request.start_date + timedelta(days=offset))
+    except (ValueError, TypeError):
+        raise CalendarError('用餐／交通設定不正確；用餐需兩段各30–50分鐘，交通需0–180分鐘。') from None
+    # Include adjacent days so busy intervals just outside the range retain buffers.
+    busy = await fetch_busy(start - timedelta(days=1), end + timedelta(days=1))
+    padded = [(a-timedelta(minutes=travel or 0), b+timedelta(minutes=travel or 0)) for a,b in busy]
+    notes = ['只查日曆忙碌區間，沒有建立或保留預約；多人容量及當日完整行程需人工確認。',
+             '候選時段是替代選項，並非可同時全部安排；重疊場次必須轉人工。']
+    if travel is None:
+        notes.append('交通時間未設定，候選時段仍需核實交通。')
+    if not os.getenv('CALENDAR_MEAL_BREAKS', '').strip():
+        notes.append('午晚飯尚未配置，須另預留各30–50分鐘，不能直接排滿。')
+    if not request.pickup_at:
+        notes.append('未提供領匙時間，無法核對領匙後1小時規則。')
+    slots = []
+    for offset in range(request.days):
+        day = request.start_date + timedelta(days=offset)
+        for hhmm in STARTS:
+            if hhmm == '18:00' and day.weekday() < 5 and not request.include_weekday_evening:
+                continue
+            if request.preference == 'morning' and hhmm != '09:00':
+                continue
+            if request.preference == 'afternoon' and hhmm == '09:00':
+                continue
+            a = datetime.combine(day, time.fromisoformat(hhmm), HK)
+            b = a + timedelta(minutes=request.duration_minutes)
+            if a <= current or (request.pickup_at and a < request.pickup_at + timedelta(hours=1)):
+                continue
+            if conflicts(a, b, padded) or conflicts(a, b, meal_breaks(day)):
+                continue
+            same_day = bool(request.pickup_at and day == request.pickup_at.date())
+            preferred = same_day or day.weekday() >= 5
+            slots.append({'start': a.isoformat(), 'end': b.isoformat(), 'preferred': preferred,
+                          'reason': '領匙當日' if same_day else '週末' if day.weekday() >= 5 else '其他日期',
+                          'evening': hhmm == '18:00', 'requires_review': True})
+    slots.sort(key=lambda s: (not s['preferred'], s['start']))
+    return {'status': 'candidates' if slots else 'no_slots', 'source': 'google',
+            'calendar_id': calendar_id(), 'timezone': 'Asia/Hong_Kong',
+            'checked_at': current.isoformat(), 'duration_minutes': request.duration_minutes,
+            'slots': slots[:12], 'total_candidates': len(slots), 'requires_review': True,
+            'summary': '已查Google日曆；以下為日曆無衝突候選，仍需人工核實。' if slots else '查詢範圍內沒有符合條件的候選時段，請改日期或轉人工。',
+            'notes': notes}
+
+
+def render_result(result):
+    lines = [result['summary']]
+    for index, slot in enumerate(result['slots'], 1):
+        start, end = parse_datetime(slot['start']), parse_datetime(slot['end'])
+        day_name = '一二三四五六日'[start.weekday()]
+        suffix = '；晚場，平日非優先' if slot['evening'] and start.weekday() < 5 else '；晚場' if slot['evening'] else ''
+        lines.append(f"{index}. {start:%Y-%m-%d} 星期{day_name} {start:%H:%M}–{end:%H:%M}（{slot['reason']}{suffix}）")
+    lines.extend(result['notes'])
+    lines.append('【只供查詢建議，未建立預約；尚未查驗登記紀錄】')
+    return '\n'.join(lines)

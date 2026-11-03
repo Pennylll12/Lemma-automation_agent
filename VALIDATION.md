@@ -1,5 +1,16 @@
 # 匯入驗證紀錄 — 2026-11-02
 
+## Google Calendar 增量驗證 — 2026-11-03
+
+- 本機 Python 3.12：51項pytest通過；依賴檢查、JavaScript語法及git diff格式檢查通過。保留原有Starlette TestClient棄用警告。
+- 新增測試涵蓋Google FreeBusy請求格式、部分／錯誤回應拒絕、憑證不外洩、管理API認證、時區、候選四場、領匙後一小時、週末優先、平日晚場選項、忙碌／用餐／交通排除、成交日待確認、舊資料庫遷移及雙程序啟動。
+- 驗證Worker保存日曆結果、相同事件不同條件拒絕、DeepSeek不能篡改時段，以及真實發送開關開啟時測試入口仍不發送。
+- 本機瀏覽器連接真實Python API，檢查新增查詢表單、缺少Google憑證的安全錯誤、只有成交日期時要求確認領匙。沒有使用真實Google憑證。
+- Google API及模型回應使用測試替身。尚未完成使用者日曆真實授權、真實Google端到端驗收或本次更新的Codespaces重驗；需按[設定指南](docs/GOOGLE_CALENDAR.md)完成。
+- 保留mock預設、獨立Worker及WhatsApp發送關閉；沒有Google事件寫入或AWS部署。
+
+以下為原匯入版本的歷史驗證紀錄。
+
 來源附件 SHA256：`fd2aa6d69f9e7ed8823494aad94ef114dff58c898e78b51cebf39db40bba90e5`。
 
 程式碼驗證版本：`4648542f7a2cc9e3f93ba667153047da20e4648a`。後續僅補充本驗證紀錄及 README 連結。

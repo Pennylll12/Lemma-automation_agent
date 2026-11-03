@@ -17,7 +17,8 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+from backend import calendar_service as calendar
 
 DB = os.getenv("DATABASE_PATH", "data/flow.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
@@ -30,8 +31,18 @@ def db():
     Path(DB).parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB, timeout=10)
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
     try:
+        # Two processes can create the database together. SQLite's busy timeout
+        # does not cover every journal-mode transition, so retry that transition.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                c.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if 'locked' not in str(exc).lower() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
         yield c
         c.commit()
     except BaseException:
@@ -61,6 +72,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS outbox (
             job_id TEXT PRIMARY KEY, state TEXT NOT NULL, provider_id TEXT, updated REAL NOT NULL);
         """)
+
+    # Additive migration preserves existing Codespaces jobs and outbox records.
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        columns = {row['name'] for row in c.execute('PRAGMA table_info(jobs)')}
+        for name in ('schedule', 'calendar_result'):
+            if name not in columns:
+                c.execute(f'ALTER TABLE jobs ADD COLUMN {name} TEXT')
 
 
 def event(c, job_id, kind, detail):
@@ -92,16 +111,18 @@ class Input(BaseModel):
     contact_id: str = Field(default="test-001", min_length=1, max_length=100)
     message_id: str = Field(default_factory=lambda: "test-" + secrets.token_hex(8), max_length=150)
     fail_once: bool = False
+    schedule: calendar.AvailabilityRequest | None = None
 
 
-def enqueue(message_id, contact, message, channel, ts, mode, fail=False):
+def enqueue(message_id, contact, message, channel, ts, mode, fail=False, schedule=None):
     now = time.time()
+    schedule_json = json.dumps(schedule, sort_keys=True, ensure_ascii=False) if schedule is not None else None
     if not message_id or len(message_id) > 150 or not contact or len(contact) > 150 or len(message) > 4000:
         raise HTTPException(422, "Invalid message fields")
     with db() as c:
-        existing=c.execute("SELECT contact_id,message,channel FROM jobs WHERE id=?",(message_id,)).fetchone()
+        existing=c.execute("SELECT contact_id,message,channel,mode,schedule FROM jobs WHERE id=?",(message_id,)).fetchone()
         if existing:
-            if (existing['contact_id'],existing['message'],existing['channel'])!=(contact,redact(message),channel):
+            if (existing['contact_id'],existing['message'],existing['channel'],existing['mode'],existing['schedule'])!=(contact,redact(message),channel,mode,schedule_json):
                 raise HTTPException(409,"Message ID already belongs to another payload")
             return {"id":message_id,"duplicate":True,"accepted":True}
         c.execute("INSERT OR IGNORE INTO contacts(id) VALUES(?)", (contact,))
@@ -109,8 +130,8 @@ def enqueue(message_id, contact, message, channel, ts, mode, fail=False):
         human = c.execute("SELECT human FROM contacts WHERE id=?", (contact,)).fetchone()[0]
         status = "handoff" if human else "queued"
         n = c.execute("""INSERT OR IGNORE INTO jobs
-            (id,contact_id,message,channel,created,updated,status,fail_once,mode)
-            VALUES(?,?,?,?,?,?,?,?,?)""", (message_id,contact,redact(message),channel,now,now,status,int(fail),mode)).rowcount
+            (id,contact_id,message,channel,created,updated,status,fail_once,mode,schedule)
+            VALUES(?,?,?,?,?,?,?,?,?,?)""", (message_id,contact,redact(message),channel,now,now,status,int(fail),mode,schedule_json)).rowcount
         if n:
             event(c,message_id,"received","已持久保存；個資規則已套用（非完整匿名保證）")
             if human:
@@ -164,6 +185,40 @@ async def answer(j):
     update_job(j,stage=2,intent=intent,provider=provider)
     if j['fail_once'] and j['attempts']==1:
         raise RuntimeError("Injected test failure")
+    if j.get('schedule') or calendar.mode() == 'google':
+        if j.get('schedule'):
+            query = calendar.AvailabilityRequest.model_validate_json(j['schedule'])
+            result = await calendar.lookup(query)
+        else:
+            result = {'status': 'needs_details', 'source': 'rules', 'slots': [], 'requires_review': True,
+                      'summary': '請先在工作台填寫日曆查詢日期、領匙時間及驗樓需時，再發送測試。',
+                      'notes': ['暫不從對話自動猜日期；只有成交日期時先確認律師信及管理處領匙安排。']}
+        update_job(j, calendar_result=json.dumps(result, ensure_ascii=False))
+        # The model may select a greeting, but cannot change dates, slots or rules.
+        opening = '你好呀！'
+        actual_provider = 'rules'
+        if provider == 'deepseek' and result['source'] == 'google':
+            async with httpx.AsyncClient(timeout=45) as client:
+                res = await client.post('https://api.deepseek.com/chat/completions',
+                    headers={'Authorization': 'Bearer ' + key},
+                    json={'model': os.getenv('DEEPSEEK_MODEL', 'deepseek-flash'),
+                          'messages': [{'role': 'system', 'content': '你是驗樓預約助手。只輸出JSON，例如{"greeting_id":1}。按客人語氣選1親切、2簡潔、3禮貌。不要輸出日期、時段或其他內容。'},
+                                       {'role': 'user', 'content': text}],
+                          'response_format': {'type': 'json_object'}, 'max_tokens': 500, 'stream': False})
+                res.raise_for_status()
+                content = res.json()['choices'][0]['message']['content']
+            try:
+                greeting_id = json.loads(content).get('greeting_id')
+                opening = {1: '你好呀！', 2: '你好，查詢結果如下。', 3: '你好，多謝你嘅查詢。'}.get(greeting_id, opening)
+            except (ValueError, TypeError, AttributeError):
+                pass  # Fixed safe greeting; never render unvalidated model text.
+            actual_provider = 'deepseek'
+        reply = opening + '\n' + calendar.render_result(result)
+        update_job(j, provider=actual_provider, intent='inspection', reply=reply, stage=3)
+        with db() as c:
+            event(c, j['id'], 'calendar_checked', 'Google日曆查詢完成；候選時段未建立預約' if result['source'] == 'google' else '資料不足；未查Google日曆，請先確認查詢條件')
+            event(c, j['id'], 'answered', 'DeepSeek已選擇回覆語氣；日期及時段由日曆規則產生' if actual_provider == 'deepseek' else '日曆規則回答完成；未呼叫模型')
+        return reply
     if provider=="mock":
         await asyncio.sleep(0.12)
         reply=("你好呀！測試資料顯示星期六上午10點、下午2點可選。你想揀邊個時段？\n【只供測試，未查真實日曆，未建立預約】"
@@ -254,7 +309,7 @@ async def process_one():
         await deliver(j,reply)
     except Exception as exc:
         # Do not persist raw provider bodies/headers: these can contain secrets.
-        update_job(j,status="failed",error="測試故障，或 AI 呼叫失敗（"+type(exc).__name__+"）")
+        update_job(j,status="failed",error=str(exc) if isinstance(exc, calendar.CalendarError) else "測試故障，或外部服務呼叫失敗（"+type(exc).__name__+"）")
         with db() as c: event(c,j['id'],"failed","處理失敗；可人工重試，尚未發送")
     return True
 
@@ -289,12 +344,22 @@ def health(): return {"ok":True,"service":"supermama-flow-lab"}
 def config():
     return {"storage":"SQLite WAL","worker":"embedded" if os.getenv('EMBEDDED_WORKER')=='true' else "separate process",
         "ai_provider":"deepseek" if os.getenv('DEEPSEEK_API_KEY') and os.getenv('AI_PROVIDER')=='deepseek' else "mock",
-        "live_send":os.getenv('LIVE_SEND_ENABLED','false')=='true',"calendar":"fixed test slots","allowlist_count":len(ALLOWLIST)}
+        "live_send":os.getenv('LIVE_SEND_ENABLED','false')=='true',"calendar":"Google Calendar 唯讀（未驗證連線）" if calendar.mode()=="google" else "固定測試空位",
+        "calendar_config":calendar.safe_config(),"allowlist_count":len(ALLOWLIST)}
 
 
 @app.post('/api/test/messages',dependencies=[Depends(admin)])
 def test_message(body:Input):
-    return enqueue(body.message_id,body.contact_id,body.message,"test-channel",time.time(),"test",body.fail_once)
+    return enqueue(body.message_id,body.contact_id,body.message,"test-channel",time.time(),"test",body.fail_once,
+        body.schedule.model_dump(mode="json") if body.schedule else None)
+
+
+@app.post('/api/calendar/availability', dependencies=[Depends(admin)])
+async def calendar_availability(body: calendar.AvailabilityRequest):
+    try:
+        return await calendar.lookup(body)
+    except calendar.CalendarError as exc:
+        raise HTTPException(503, str(exc)) from None
 
 
 @app.post('/webhooks/sleekflow')
@@ -316,7 +381,13 @@ async def webhook(request:Request,x_webhook_secret:str=Header(default="")):
         if not 0<ts<=time.time()+60: raise ValueError()
     except (ValueError,TypeError): raise HTTPException(422,"timestamp must be Unix seconds, not milliseconds")
     # Bound received timestamp to server arrival, and reject reused IDs with different data.
-    return enqueue(b['message_id'],phone,b['message'],b['channel'],min(ts,time.time()),"webhook")
+    schedule = None
+    if b.get('schedule') is not None:
+        try:
+            schedule = calendar.AvailabilityRequest.model_validate(b['schedule']).model_dump(mode='json')
+        except ValidationError:
+            raise HTTPException(422, 'Invalid schedule fields; use the documented calendar contract') from None
+    return enqueue(b['message_id'],phone,b['message'],b['channel'],min(ts,time.time()),"webhook",schedule=schedule)
 
 
 @app.get('/api/jobs',dependencies=[Depends(admin)])
@@ -328,6 +399,8 @@ def jobs():
             item=dict(r)
             item['events']=[dict(e) for e in c.execute("SELECT at,kind,detail FROM events WHERE job_id=? ORDER BY id",(r['id'],))]
             item.pop('claim',None)
+            for name in ('schedule', 'calendar_result'):
+                item[name] = json.loads(item[name]) if item.get(name) else None
             result.append(item)
         return {"jobs":result}
 
@@ -370,7 +443,11 @@ if static.exists(): app.mount('/',StaticFiles(directory=static,html=True),name='
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser()
-    parser.add_argument('command',choices=['worker','init'])
+    parser.add_argument('command',choices=['worker','init','serve'])
     args=parser.parse_args()
     init_db()
     if args.command=='worker': asyncio.run(worker_loop())
+
+    if args.command=='serve':
+        import uvicorn
+        uvicorn.run(app, host='0.0.0.0', port=8000)

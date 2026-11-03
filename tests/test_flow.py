@@ -16,6 +16,7 @@ def client(tmp_path,monkeypatch):
     monkeypatch.setattr(m,'WEBHOOK_SECRET','test-webhook')
     monkeypatch.setattr(m,'ALLOWLIST',{'85290000001'})
     monkeypatch.setenv('AI_PROVIDER','mock')
+    monkeypatch.setenv('CALENDAR_MODE','mock')
     monkeypatch.setenv('LIVE_SEND_ENABLED','false')
     monkeypatch.setenv('EMBEDDED_WORKER','false')
     with TestClient(m.app) as c:
