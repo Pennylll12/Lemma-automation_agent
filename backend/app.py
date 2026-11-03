@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 from backend import calendar_service as calendar
+from backend import intent_service as intents
 
 DB = os.getenv("DATABASE_PATH", "data/flow.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
@@ -77,9 +78,11 @@ def init_db():
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
         columns = {row['name'] for row in c.execute('PRAGMA table_info(jobs)')}
-        for name in ('schedule', 'calendar_result'):
+        for name in ('schedule', 'calendar_result', 'understanding', 'resolved_schedule'):
             if name not in columns:
                 c.execute(f'ALTER TABLE jobs ADD COLUMN {name} TEXT')
+        if 'reset_context' not in columns:
+            c.execute('ALTER TABLE jobs ADD COLUMN reset_context INTEGER NOT NULL DEFAULT 0')
 
 
 def event(c, job_id, kind, detail):
@@ -112,17 +115,18 @@ class Input(BaseModel):
     message_id: str = Field(default_factory=lambda: "test-" + secrets.token_hex(8), max_length=150)
     fail_once: bool = False
     schedule: calendar.AvailabilityRequest | None = None
+    reset_context: bool = False
 
 
-def enqueue(message_id, contact, message, channel, ts, mode, fail=False, schedule=None):
+def enqueue(message_id, contact, message, channel, ts, mode, fail=False, schedule=None, reset_context=False):
     now = time.time()
     schedule_json = json.dumps(schedule, sort_keys=True, ensure_ascii=False) if schedule is not None else None
     if not message_id or len(message_id) > 150 or not contact or len(contact) > 150 or len(message) > 4000:
         raise HTTPException(422, "Invalid message fields")
     with db() as c:
-        existing=c.execute("SELECT contact_id,message,channel,mode,schedule FROM jobs WHERE id=?",(message_id,)).fetchone()
+        existing=c.execute("SELECT contact_id,message,channel,mode,schedule,reset_context FROM jobs WHERE id=?",(message_id,)).fetchone()
         if existing:
-            if (existing['contact_id'],existing['message'],existing['channel'],existing['mode'],existing['schedule'])!=(contact,redact(message),channel,mode,schedule_json):
+            if (existing['contact_id'],existing['message'],existing['channel'],existing['mode'],existing['schedule'],bool(existing['reset_context']))!=(contact,redact(message),channel,mode,schedule_json,reset_context):
                 raise HTTPException(409,"Message ID already belongs to another payload")
             return {"id":message_id,"duplicate":True,"accepted":True}
         c.execute("INSERT OR IGNORE INTO contacts(id) VALUES(?)", (contact,))
@@ -130,8 +134,8 @@ def enqueue(message_id, contact, message, channel, ts, mode, fail=False, schedul
         human = c.execute("SELECT human FROM contacts WHERE id=?", (contact,)).fetchone()[0]
         status = "handoff" if human else "queued"
         n = c.execute("""INSERT OR IGNORE INTO jobs
-            (id,contact_id,message,channel,created,updated,status,fail_once,mode,schedule)
-            VALUES(?,?,?,?,?,?,?,?,?,?)""", (message_id,contact,redact(message),channel,now,now,status,int(fail),mode,schedule_json)).rowcount
+            (id,contact_id,message,channel,created,updated,status,fail_once,mode,schedule,reset_context)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (message_id,contact,redact(message),channel,now,now,status,int(fail),mode,schedule_json,int(reset_context))).rowcount
         if n:
             event(c,message_id,"received","已持久保存；個資規則已套用（非完整匿名保證）")
             if human:
@@ -173,6 +177,22 @@ def update_job(j, **fields):
             (*fields.values(),j['id'],j['claim']))
 
 
+async def understand(text, contact_id, received_at=None, reset_context=False, before_id=None):
+    received_at = received_at or time.time()
+    context = None
+    if not reset_context:
+        with db() as c:
+            row = c.execute('''SELECT understanding,created FROM jobs WHERE contact_id=?
+                AND created>=? AND created<=?
+                AND rowid < COALESCE((SELECT rowid FROM jobs WHERE id=?), 9223372036854775807)
+                ORDER BY rowid DESC LIMIT 1''',
+                (contact_id,received_at-86400,received_at,before_id)).fetchone()
+            if row and row['understanding']:
+                context = json.loads(row['understanding'])
+    anchor = datetime.fromtimestamp(received_at,calendar.HK).date()
+    return await intents.interpret(redact(text),anchor,context)
+
+
 async def answer(j):
     text=j['message']
     # Only read context for this contact. It has already passed basic local masking.
@@ -186,18 +206,30 @@ async def answer(j):
     if j['fail_once'] and j['attempts']==1:
         raise RuntimeError("Injected test failure")
     if j.get('schedule') or calendar.mode() == 'google':
+        understanding = None
         if j.get('schedule'):
             query = calendar.AvailabilityRequest.model_validate_json(j['schedule'])
+            update_job(j,resolved_schedule=query.model_dump_json())
             result = await calendar.lookup(query)
         else:
-            result = {'status': 'needs_details', 'source': 'rules', 'slots': [], 'requires_review': True,
-                      'summary': '請先在工作台填寫日曆查詢日期、領匙時間及驗樓需時，再發送測試。',
-                      'notes': ['暫不從對話自動猜日期；只有成交日期時先確認律師信及管理處領匙安排。']}
+            understanding = await understand(j['message'], j['contact_id'], j['created'], j.get('reset_context',False), j['id'])
+            update_job(j,understanding=json.dumps(understanding,ensure_ascii=False),intent=understanding['intent'])
+            if understanding['schedule']:
+                query = calendar.AvailabilityRequest.model_validate(understanding['schedule'])
+                update_job(j,resolved_schedule=query.model_dump_json())
+                result = await calendar.lookup(query)
+            else:
+                result = {'status':'needs_details','source':'rules','slots':[], 'requires_review':True,
+                          'summary':'識別結果需補充資料或人工跟進，未查Google日曆。',
+                          'customer_question':intents.clarification(understanding),'notes':understanding['notes']}
+            result['understanding'] = understanding
         update_job(j, calendar_result=json.dumps(result, ensure_ascii=False))
         # The model may select a greeting, but cannot change dates, slots or rules.
         opening = '你好呀！'
         actual_provider = 'rules'
-        if provider == 'deepseek' and result['source'] == 'google':
+        if understanding:
+            actual_provider = understanding['provider']
+        if not understanding and provider == 'deepseek' and result['source'] == 'google':
             async with httpx.AsyncClient(timeout=45) as client:
                 res = await client.post('https://api.deepseek.com/chat/completions',
                     headers={'Authorization': 'Bearer ' + key},
@@ -214,10 +246,12 @@ async def answer(j):
                 pass  # Fixed safe greeting; never render unvalidated model text.
             actual_provider = 'deepseek'
         reply = opening + '\n' + calendar.render_customer_reply(result)
-        update_job(j, provider=actual_provider, intent='inspection', reply=reply, stage=3)
+        update_job(j, provider=actual_provider, intent=understanding['intent'] if understanding else 'inspection', reply=reply, stage=3)
         with db() as c:
             event(c, j['id'], 'calendar_checked', 'Google日曆查詢完成；候選時段未建立預約' if result['source'] == 'google' else '資料不足；未查Google日曆，請先確認查詢條件')
-            event(c, j['id'], 'answered', 'DeepSeek已選擇回覆語氣；日期及時段由日曆規則產生' if actual_provider == 'deepseek' else '日曆規則回答完成；未呼叫模型')
+            if understanding:
+                event(c,j['id'],'interpreted','自動識別：'+understanding['intent']+'；'+('已產生查詢條件' if understanding['schedule'] else '追問或轉人工'))
+            event(c, j['id'], 'answered', '意圖已識別；回覆按已核實日曆及規則產生' if understanding else 'DeepSeek已選擇回覆語氣；日期及時段由日曆規則產生' if actual_provider == 'deepseek' else '日曆規則回答完成；未呼叫模型')
         return reply
     if provider=="mock":
         await asyncio.sleep(0.12)
@@ -351,7 +385,18 @@ def config():
 @app.post('/api/test/messages',dependencies=[Depends(admin)])
 def test_message(body:Input):
     return enqueue(body.message_id,body.contact_id,body.message,"test-channel",time.time(),"test",body.fail_once,
-        body.schedule.model_dump(mode="json") if body.schedule else None)
+        body.schedule.model_dump(mode="json") if body.schedule else None,body.reset_context)
+
+
+class InterpretInput(BaseModel):
+    message: str = Field(min_length=1,max_length=4000)
+    contact_id: str = Field(default='test-001',min_length=1,max_length=100)
+    reset_context: bool = False
+
+
+@app.post('/api/intent/interpret',dependencies=[Depends(admin)])
+async def interpret_message(body:InterpretInput):
+    return await understand(body.message,body.contact_id,reset_context=body.reset_context)
 
 
 @app.post('/api/calendar/availability', dependencies=[Depends(admin)])
@@ -387,7 +432,9 @@ async def webhook(request:Request,x_webhook_secret:str=Header(default="")):
             schedule = calendar.AvailabilityRequest.model_validate(b['schedule']).model_dump(mode='json')
         except ValidationError:
             raise HTTPException(422, 'Invalid schedule fields; use the documented calendar contract') from None
-    return enqueue(b['message_id'],phone,b['message'],b['channel'],min(ts,time.time()),"webhook",schedule=schedule)
+    reset = b.get('reset_context',False)
+    if not isinstance(reset,bool): raise HTTPException(422,'reset_context must be boolean')
+    return enqueue(b['message_id'],phone,b['message'],b['channel'],min(ts,time.time()),"webhook",schedule=schedule,reset_context=reset)
 
 
 @app.get('/api/jobs',dependencies=[Depends(admin)])
@@ -399,7 +446,7 @@ def jobs():
             item=dict(r)
             item['events']=[dict(e) for e in c.execute("SELECT at,kind,detail FROM events WHERE job_id=? ORDER BY id",(r['id'],))]
             item.pop('claim',None)
-            for name in ('schedule', 'calendar_result'):
+            for name in ('schedule', 'calendar_result', 'understanding', 'resolved_schedule'):
                 item[name] = json.loads(item[name]) if item.get(name) else None
             result.append(item)
         return {"jobs":result}

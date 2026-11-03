@@ -247,7 +247,7 @@ def test_google_mode_no_conditions_asks_instead_of_guessing(client, busy):
     asyncio.run(m.process_one())
     j=client.get('/api/jobs').json()['jobs'][0]
     assert j['calendar_result']['status']=='needs_details'
-    assert '請先' in j['reply'] and '上午10點' not in j['reply']
+    assert '邊日驗樓' in j['reply'] and '上午10點' not in j['reply']
 
 
 def test_calendar_failure_in_worker_no_outbox(client, monkeypatch):

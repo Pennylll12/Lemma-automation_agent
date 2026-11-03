@@ -29,8 +29,10 @@ class AvailabilityRequest(BaseModel):
     duration_minutes: Literal[120, 150, 180] = 180
     pickup_at: datetime | None = None
     completion_date: date | None = None
-    preference: Literal['any', 'morning', 'afternoon'] = 'any'
+    preference: Literal['any', 'morning', 'afternoon', 'evening'] = 'any'
     include_weekday_evening: bool = False
+    plan_from_completion: bool = False
+    weekend_only: bool = False
 
     @field_validator('pickup_at')
     @classmethod
@@ -159,11 +161,48 @@ def travel_minutes():
     return minutes
 
 
+def business_calendar():
+    data = json.loads(Path(__file__).with_name('hk_holidays.json').read_text())
+    value = os.getenv('CALENDAR_BUSINESS_WEEK', 'mon_sat').strip()
+    if not value: value = 'mon_sat'
+    if value not in ('', 'mon_fri', 'mon_sat'):
+        raise CalendarError('CALENDAR_BUSINESS_WEEK只可為mon_fri或mon_sat。')
+    return (6 if value == 'mon_sat' else 5), {date.fromisoformat(d) for d in data['dates']}, set(data['covered_years']), not bool(value)
+
+
+def completion_window(completion):
+    count, holidays, years, provisional = business_calendar()
+    def workday(day):
+        if day.year not in years:
+            raise CalendarError('公眾假期資料未涵蓋所需年份，請人工確認領匙日期。')
+        return day.weekday() < count and day not in holidays
+    def advance(day, n):
+        for _ in range(n):
+            day += timedelta(days=1)
+            while not workday(day): day += timedelta(days=1)
+        return day
+    letter = advance(completion, 2)
+    return {'letter_date':letter.isoformat(),'earliest_pickup':advance(letter,2).isoformat(),
+            'pickup_deadline':advance(completion,10).isoformat(),
+            'assumption':('暫按' if provisional else '按已配置')+('星期一至六' if count==6 else '星期一至五')+'、排除香港公眾假期；成交翌日起算第一個工作天。',
+            'provisional':provisional, 'confirmed':False}, workday
+
+
 async def lookup(request: AvailabilityRequest):
     current = now_hk()
     if request.start_date < current.date() or request.start_date > current.date() + timedelta(days=366):
         raise CalendarError('請選擇今天起一年內的查詢開始日期。')
-    if request.completion_date and not request.pickup_at:
+    planning = None
+    if request.completion_date and not request.pickup_at and request.plan_from_completion:
+        planning, workday = completion_window(request.completion_date)
+        first = max(current.date(), date.fromisoformat(planning['earliest_pickup']), request.start_date)
+        deadline = date.fromisoformat(planning['pickup_deadline'])
+        if first > deadline:
+            return {'status':'needs_details','source':'rules','slots':[], 'requires_review':True,
+                    'summary':'估算領匙期限已過，請先同律師樓及管理處確認可領匙日期。',
+                    'notes':[planning['assumption']], 'customer_question':'按目前估算，你嘅領匙期限可能已過。想先確認你係咪已經領匙，或者管理處有冇另行安排？'}
+        request = request.model_copy(update={'start_date':first,'days':min(request.days,14,(deadline-first).days+3)})
+    if request.completion_date and not request.pickup_at and not planning:
         return {
             'status': 'needs_details', 'source': 'rules', 'slots': [], 'requires_review': True,
             'summary': '只有成交日期，請先確認實際領匙日期及時間，再查驗樓空位。',
@@ -190,6 +229,8 @@ async def lookup(request: AvailabilityRequest):
     padded = [(a-timedelta(minutes=travel or 0), b+timedelta(minutes=travel or 0)) for a,b in busy]
     notes = ['只查日曆忙碌區間，沒有建立或保留預約；多人容量及當日完整行程需人工確認。',
              '候選時段是替代選項，並非可同時全部安排；重疊場次必須轉人工。']
+    if planning:
+        notes.extend([planning['assumption'],'律師信、領匙最早日及10工作天期限均屬估算；未核實管理處可約日期、辦公時間或已領信。'])
     if travel is None:
         notes.append('交通時間未設定，候選時段仍需核實交通。')
     if not os.getenv('CALENDAR_MEAL_BREAKS', '').strip():
@@ -199,6 +240,7 @@ async def lookup(request: AvailabilityRequest):
     slots = []
     for offset in range(request.days):
         day = request.start_date + timedelta(days=offset)
+        if request.weekend_only and day.weekday() < 5: continue
         for hhmm in STARTS:
             if hhmm == '18:00' and day.weekday() < 5 and not request.include_weekday_evening:
                 continue
@@ -206,29 +248,46 @@ async def lookup(request: AvailabilityRequest):
                 continue
             if request.preference == 'afternoon' and hhmm == '09:00':
                 continue
+            if request.preference == 'evening' and hhmm != '18:00': continue
             a = datetime.combine(day, time.fromisoformat(hhmm), HK)
             b = a + timedelta(minutes=request.duration_minutes)
             if a <= current or (request.pickup_at and a < request.pickup_at + timedelta(hours=1)):
                 continue
             if conflicts(a, b, padded) or conflicts(a, b, meal_breaks(day)):
                 continue
+            pickup_plan = None
+            if planning:
+                pickup_day = min(day, date.fromisoformat(planning['pickup_deadline']))
+                # A morning inspection cannot assume management opens at 08:00.
+                if pickup_day == day and a.hour < 12: pickup_day -= timedelta(days=1)
+                while not workday(pickup_day): pickup_day -= timedelta(days=1)
+                if pickup_day < date.fromisoformat(planning['earliest_pickup']) or pickup_day < current.date(): continue
+                pickup_plan = {'date':pickup_day.isoformat(),
+                               'latest_time':(a-timedelta(hours=1)).strftime('%H:%M') if pickup_day==day else None,
+                               'same_day':pickup_day==day,'confirmed':False}
             same_day = bool(request.pickup_at and day == request.pickup_at.date())
             preferred = same_day or day.weekday() >= 5
             slots.append({'start': a.isoformat(), 'end': b.isoformat(), 'preferred': preferred,
                           'reason': '領匙當日' if same_day else '週末' if day.weekday() >= 5 else '其他日期',
-                          'evening': hhmm == '18:00', 'requires_review': True})
-    slots.sort(key=lambda s: (not s['preferred'], s['start']))
+                          'evening': hhmm == '18:00', 'requires_review': True,
+                          **({'pickup_suggestion':pickup_plan} if pickup_plan else {})})
+    slots.sort(key=lambda s: (False if planning else not s['preferred'], s['start']))
     return {'status': 'candidates' if slots else 'no_slots', 'source': 'google',
             'calendar_id': calendar_id(), 'timezone': 'Asia/Hong_Kong',
             'checked_at': current.isoformat(), 'duration_minutes': request.duration_minutes,
             'slots': slots[:12], 'total_candidates': len(slots), 'requires_review': True,
             'summary': '已查Google日曆；以下為日曆無衝突候選，仍需人工核實。' if slots else '查詢範圍內沒有符合條件的候選時段，請改日期或轉人工。',
-            'notes': notes}
+            'notes': notes, 'planning':planning, 'query':request.model_dump(mode='json')}
 
 
 def render_customer_reply(result):
     """Customer copy uses only verified slots; operational notes stay in the UI."""
     if result['status'] == 'needs_details':
+        if result.get('customer_question'): return result['customer_question']
+        if '領匙日期為星期日' in result['summary']:
+            return '你提到星期日領匙，不過按目前安排管理處星期日唔開門。想先同你確認實際領匙日期同時間，再幫你查驗樓時段。'
+        if '領匙時間早於成交日期' in result['summary']:
+            return '你提供嘅領匙時間早過成交日期，想先確認兩個日期有冇寫錯，再幫你查驗樓時段。'
         if result.get('source') == 'rules' and '只有成交日期' in result['summary']:
             return ('收到！成交後最快第二個工作天可以拎律師信，再打電話去管理處約領匙，一般可約兩個工作天後。'
                     '\n成交日起計10個工作天內或之前可以領匙，實際日期要同律師樓及管理處確認。'
@@ -236,11 +295,35 @@ def render_customer_reply(result):
         return '請先確認領匙日期、時間，同埋想邊日驗樓呀？有齊資料，我再幫你查合適時段。'
     if not result['slots']:
         return '幫你查過喇，今次查詢範圍暫時未搵到合適嘅驗樓時段。你仲有邊幾日方便？我再幫你睇吓。'
-    lines = ['幫你查過喇，可以先考慮以下驗樓時段：']
-    for slot in result['slots'][:3]:
+    planning = result.get('planning')
+    if planning:
+        lines = ['我先按驗樓空位幫你配合領匙安排，以下方案都要先同律師樓及管理處確認：',
+                 planning['assumption'], '最快領信及管理處兩個工作天後可約領匙都係估算，唔代表已經約到。']
+    else:
+        lines = ['幫你查過喇，可以先考慮以下驗樓時段：']
+        query = result.get('query',{})
+        if query.get('pickup_at'):
+            pickup = parse_datetime(query['pickup_at'])
+            same_day = any(parse_datetime(s['start']).date()==pickup.date() for s in result['slots'])
+            lines.insert(0, f'你{pickup.month}月{pickup.day}日{pickup:%H:%M}領匙，驗樓最早可以安排喺領匙一小時後。')
+            if not same_day: lines.insert(1,'今次查詢範圍內未見領匙當日合適場次，以下係其他候選。')
+    offered = result['slots'][:3]
+    if planning:
+        first = result['slots'][0]
+        alternative = next((s for s in result['slots'][1:] if parse_datetime(s['start']).weekday()>=5
+                            and s['start'][:10]!=first['start'][:10]),None)
+        offered = [first,alternative] if alternative else result['slots'][:2]
+    for slot in offered:
         start, end = parse_datetime(slot['start']), parse_datetime(slot['end'])
         weekday = '一二三四五六日'[start.weekday()]
         lines.append(f'・{start.month}月{start.day}日（星期{weekday}）{start:%H:%M}–{end:%H:%M}')
+        if planning and slot.get('pickup_suggestion'):
+            p = slot['pickup_suggestion']
+            day = date.fromisoformat(p['date'])
+            if p['same_day']:
+                lines.append(f"  可向管理處查詢{day.month}月{day.day}日領匙，最遲{p['latest_time']}完成，預留至少一小時。")
+            else:
+                lines.append(f'  可向管理處查詢{day.month}月{day.day}日先領匙，再到上述時段驗樓。')
     lines.extend(['你比較方便邊個時段呀？我哋再核實安排，確認後先落實預約。'])
     return '\n'.join(lines)
 

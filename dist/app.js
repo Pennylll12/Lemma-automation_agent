@@ -3,7 +3,7 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const labels={queued:'排隊中',processing:'處理中',simulated:'模擬完成',accepted:'API 已接受',failed:'處理失敗',handoff:'人工接管',window_closed:'窗口已關閉',needs_review:'發送待核對'};
 let demo=[],human={},api='',token='',selected='',currentTab='lab',busy=false,polling=false,settings=null;
 try{const saved=JSON.parse(localStorage.getItem('sm-flow-demo')||'{}');demo=saved.jobs||[];human=saved.human||{};api=sessionStorage.getItem('sm-api')||'';token=sessionStorage.getItem('sm-token')||'';}catch{}
-let jobs=demo;
+let jobs=demo;let autoFillJob='';
 // Browser simulation resumes only while this page is open; it is not a server worker.
 demo.forEach(j=>{if(j.status==='processing')j.status='queued'});
 const clock=t=>new Date(t*1000).toLocaleTimeString('zh-HK',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
@@ -12,7 +12,7 @@ function toast(text){$('toast').textContent=text;$('toast').classList.add('show'
 function persist(){localStorage.setItem('sm-flow-demo',JSON.stringify({jobs:demo.slice(0,100),human}))}
 function log(j,kind,detail){j.events.push({at:Date.now()/1000,kind,detail});j.updated=Date.now()/1000}
 function masked(text){return text.replace(/(?<!\d)(?:\+?852[ -]?)?[456789]\d{3}[ -]?\d{4}(?!\d)/g,'[電話]').replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g,'[電郵]').replace(/(?:我叫|姓名[：:])[^，,。\s]{1,16}/g,'姓名：[姓名]').replace(/[A-Za-zＡ-Ｚ一二三四五六七八九十]+座\s*\d+\s*(?:樓)?\s*\d*\s*室/g,'[單位]')}
-async function request(path,body,base=api,key=token){const res=await fetch(base.replace(/\/$/,'')+path,{method:body===undefined?'GET':'POST',headers:{Authorization:'Bearer '+key,...(body===undefined?{}:{'Content-Type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(path.startsWith('/api/calendar/')?45000:12000)});const data=await res.json().catch(()=>({}));if(!res.ok)throw Error(typeof data.detail==='string'?data.detail:'API 回應失敗：'+res.status);return data}
+async function request(path,body,base=api,key=token){const res=await fetch(base.replace(/\/$/,'')+path,{method:body===undefined?'GET':'POST',headers:{Authorization:'Bearer '+key,...(body===undefined?{}:{'Content-Type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout((path.startsWith('/api/calendar/')||path.startsWith('/api/intent/'))?45000:12000)});const data=await res.json().catch(()=>({}));if(!res.ok)throw Error(typeof data.detail==='string'?data.detail:'API 回應失敗：'+res.status);return data}
 async function load(){if(!api){jobs=demo;render();return}if(polling)return;polling=true;try{const data=await request('/api/jobs');jobs=data.jobs;render()}catch(e){$('noticeTitle').textContent='後端暫時未能連接';$('noticeText').textContent='畫面可能係上次載入紀錄。請檢查服務、Token 及 CORS 設定。';}finally{polling=false}}
 function switchTab(name){currentTab=name;for(const tab of ['lab','jobs','settings'])$('tab-'+tab).hidden=tab!==name;document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x.dataset.tab===name));const titles={lab:['流程測試','每一次對話，都有跡可循。','由一則訊息開始，驗證你嘅 AI 客服流程。'],jobs:['任務紀錄','每個任務，都有清楚嘅去向。','查看處理狀態、回覆與操作紀錄。'],settings:['連接設定','將測試，接上真正嘅執行層。','連接 Python FastAPI，啟用持久任務與背景 Worker。']};$('crumb').textContent=titles[name][0];$('pageTitle').textContent=titles[name][1];$('pageSubtitle').textContent=titles[name][2]}
 document.querySelectorAll('[data-tab]').forEach(x=>x.onclick=()=>switchTab(x.dataset.tab));document.querySelectorAll('[data-goto]').forEach(x=>x.onclick=()=>switchTab(x.dataset.goto));$('connectShortcut').onclick=()=>switchTab('settings');
@@ -28,7 +28,7 @@ function render(){
  $('recentRows').innerHTML=jobs.slice(0,5).map(row).join('')||'<tr><td colspan="5" class="emptyrow">未有任務。發送第一則測試訊息開始。</td></tr>';
  const filtered=jobs.filter(j=>$('statusFilter').value==='all'||j.status===$('statusFilter').value);
  $('allRows').innerHTML=filtered.map(row).join('')||'<tr><td colspan="5" class="emptyrow">未有符合條件嘅任務。</td></tr>';bindRows();
- const j=jobs.find(x=>x.id===selected);const stage=j?.stage||0;
+ const j=jobs.find(x=>x.id===selected);if(j?.understanding&&j.id===autoFillJob&&!$('useCalendar').checked){applyUnderstanding(j.understanding);autoFillJob=''}const stage=j?.stage||0;
  $('pipeline').innerHTML=['接收訊息','背景排隊','AI 處理','準備回覆'].map((s,i)=>`<div class="step ${stage>i?'complete':stage===i&&j?'current':''}"><i>${stage>i?'✓':i+1}</i>${s}</div>`).join('');
  if(j){$('resultArea').innerHTML=`<div class="resulttop"><span>${esc(j.id.slice(0,28))}</span><span class="status ${esc(j.status)}">${esc(labels[j.status]||j.status)}</span></div>${j.reply?`<div class="replycard"><div class="replytitle"><b>✦ ${j.calendar_result?'建議客人回覆':j.provider==='deepseek'?'DeepSeek 回答':'規則模擬回答'}</b><span>${j.mode==='test'?'測試入口':'Webhook'}</span></div><p>${esc(j.reply)}</p><small>${j.status==='accepted'?'API 已接受，尚未驗證 WhatsApp 送達':'未宣告 WhatsApp 送達；請以任務狀態為準。'}</small></div>`:''}${j.calendar_result?`<div class="calendar-source">${esc(j.calendar_result.source==='google'?'來源：Google Calendar 真實查詢快照，候選未落實':'來源：規則提示，未查Google日曆')}</div>`:''}${j.calendar_result?calendarInternal(j.calendar_result):''}${j.error?`<div class="errorbox">${esc(j.error)}</div>`:''}<div class="eventlist">${(j.events||[]).map(e=>`<div class="event"><time>${clock(e.at)}</time><span>${esc(e.detail)}</span></div>`).join('')}</div><div class="resultactions">${j.status==='failed'?'<button class="button secondary" id="retryBtn">↻ 重試任務</button>':''}${j.mode==='test'?'<button class="textbtn" id="duplicateBtn">重送同一事件（測試去重）</button>':''}</div>`;
  if($('retryBtn'))$('retryBtn').onclick=()=>retry(j);if($('duplicateBtn'))$('duplicateBtn').onclick=()=>duplicate(j);
@@ -42,10 +42,10 @@ async function demoWork(){if(busy)return;busy=true;try{while(true){const j=[...d
  if(human[j.contact_id]){j.status='handoff';log(j,'handoff','發送前檢查：人工接管，停止')}else{j.stage=4;j.status='simulated';log(j,'simulated','回覆已保存，沒有發送 WhatsApp')}
  persist();render();}}
  finally{busy=false}}
-async function send(){const text=$('message').value.trim();if(!text){toast('先輸入一則測試訊息。');$('message').focus();return}$('sendBtn').disabled=true;try{const body={message:text,contact_id:$('contact').value,message_id:'test-'+(crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+'-'+Math.random().toString(36).slice(2)),fail_once:$('failOnce').checked};if($('useCalendar').checked){if(!api)throw Error('真實日曆需先連接Python後端');body.schedule=calendarPayload()}if(api){const r=await request('/api/test/messages',body);selected=r.id;await load();toast('已交畀後端，等待 Worker 處理。')}else{const now=Date.now()/1000;const j={id:body.message_id,contact_id:body.contact_id,message:masked(text),created:now,updated:now,status:human[body.contact_id]?'handoff':'queued',stage:0,attempts:0,reply:null,error:null,fail_once:body.fail_once,mode:'test',provider:'mock',events:[]};log(j,'received','模擬事件已保存於此瀏覽器');demo.unshift(j);selected=j.id;persist();render();demoWork()}$('message').value='';$('message').oninput()}catch(e){toast('提交失敗：'+e.message)}finally{$('sendBtn').disabled=false}}
+async function send(){const text=$('message').value.trim();if(!text){toast('先輸入一則測試訊息。');$('message').focus();return}$('sendBtn').disabled=true;try{const body={message:text,contact_id:$('contact').value,message_id:'test-'+(crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+'-'+Math.random().toString(36).slice(2)),fail_once:$('failOnce').checked,reset_context:$('resetContext').checked};if($('useCalendar').checked){if(!api)throw Error('真實日曆需先連接Python後端');body.schedule=calendarPayload()}if(api){const r=await request('/api/test/messages',body);selected=r.id;autoFillJob=r.id;await load();toast('已交畀後端，等待 Worker 處理。')}else{const now=Date.now()/1000;const j={id:body.message_id,contact_id:body.contact_id,message:masked(text),created:now,updated:now,status:human[body.contact_id]?'handoff':'queued',stage:0,attempts:0,reply:null,error:null,fail_once:body.fail_once,mode:'test',provider:'mock',events:[]};log(j,'received','模擬事件已保存於此瀏覽器');demo.unshift(j);selected=j.id;persist();render();demoWork()}$('message').value='';$('message').oninput()}catch(e){toast('提交失敗：'+e.message)}finally{$('sendBtn').disabled=false}}
 $('sendBtn').onclick=send;
 async function retry(j){try{if(api){await request('/api/jobs/'+encodeURIComponent(j.id)+'/retry',{});await load()}else{if(j.status!=='failed')return;j.status='queued';j.stage=0;j.error=null;log(j,'retry','人工重試尚未發送的任務');persist();render();demoWork()}toast('已重新排隊。')}catch(e){toast(e.message)}}
-async function duplicate(j){try{if(api){const r=await request('/api/test/messages',{message:j.message,contact_id:j.contact_id,message_id:j.id,fail_once:!!j.fail_once,...(j.schedule?{schedule:j.schedule}:{})});toast(r.duplicate?'重複事件已攔截，冇建立新任務。':'已提交事件');await load()}else{toast('重複 Message ID 已攔截，任務數量不變。')}}catch(e){toast(e.message)}}
+async function duplicate(j){try{if(api){const r=await request('/api/test/messages',{message:j.message,contact_id:j.contact_id,message_id:j.id,fail_once:!!j.fail_once,reset_context:!!j.reset_context,...(j.schedule?{schedule:j.schedule}:{})});toast(r.duplicate?'重複事件已攔截，冇建立新任務。':'已提交事件');await load()}else{toast('重複 Message ID 已攔截，任務數量不變。')}}catch(e){toast(e.message)}}
 $('takeoverBtn').onclick=async()=>{const id=$('contact').value;const held=api?jobs.some(j=>j.contact_id===id&&j.human):!!human[id];try{if(api){await request('/api/contacts/'+encodeURIComponent(id)+'/takeover',{human:!held});await load()}else{human[id]=!held;if(human[id])demo.filter(j=>j.contact_id===id&&['queued','processing'].includes(j.status)).forEach(j=>{j.status='handoff';log(j,'handoff','人工已接管，停止自動處理')});persist();render()}toast(held?'已恢復 AI；舊接管任務不會自動重送。':'已人工接管此測試客人。')}catch(e){toast(e.message)}};
 $('apiUrl').value=api;$('apiToken').value=token;
 function renderConfig(){if(!settings)return;$('capabilities').innerHTML=Object.entries({'資料庫':settings.storage,'背景 Worker':settings.worker,'AI':settings.ai_provider,'日曆':settings.calendar,'Webhook 真實發送':settings.live_send?'已啟用（僅限白名單）':'關閉','測試電話白名單':settings.allowlist_count+' 個'}).map(([k,v])=>`<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('')}
@@ -56,11 +56,11 @@ $('exportBtn').onclick=()=>{const blob=new Blob([JSON.stringify({exported_at:new
 $('helpBtn').onclick=()=>$('helpDialog').showModal();$('closeHelp').onclick=()=>$('helpDialog').close();$('helpDialog').onclick=e=>{if(e.target===$('helpDialog'))$('helpDialog').close()};
 render();if(api){request('/api/config').then(r=>{settings=r;renderConfig();load()}).catch(()=>load())}else demoWork();setInterval(()=>{if(api)load()},2000);
 
-// Calendar conditions are explicit; no model-inferred dates are submitted.
+// Automatic extraction remains separate from explicit manual overrides.
 function calendarPayload(){
  const start=$('calendarDate').value;
  if(!start)throw Error('請先填寫查詢開始日期');
- const value={start_date:start,days:Number($('calendarDays').value),duration_minutes:Number($('inspectionDuration').value),preference:$('calendarPreference').value,include_weekday_evening:$('weekdayEvening').checked};
+ const value={plan_from_completion:$('planCompletion').checked,weekend_only:$('weekendOnly').checked,start_date:start,days:Number($('calendarDays').value),duration_minutes:Number($('inspectionDuration').value),preference:$('calendarPreference').value,include_weekday_evening:$('weekdayEvening').checked};
  if($('pickupAt').value)value.pickup_at=$('pickupAt').value+':00+08:00';
  if($('completionDate').value)value.completion_date=$('completionDate').value;
  return value;
@@ -70,7 +70,14 @@ $('calendarQueryBtn').onclick=async()=>{
  const target=$('calendarResult');
  try{
   if(!api)throw Error('請先連接Python後端');
-  const payload=calendarPayload();$('calendarQueryBtn').disabled=true;target.textContent='正在查Google日曆，請稍等…';
+  $('calendarQueryBtn').disabled=true;
+  let payload;
+  if(!$('useCalendar').checked&&$('message').value.trim()){
+   target.textContent='正在識別查詢條件…';
+   const data=await request('/api/intent/interpret',{message:$('message').value.trim(),contact_id:$('contact').value,reset_context:$('resetContext').checked});
+   applyUnderstanding(data);if(!data.schedule){target.textContent='暫未查日曆：'+((data.questions||[]).join('；')||'此意圖需人工跟進');return}payload=data.schedule;
+  }else payload=calendarPayload();
+  target.textContent='正在查Google日曆，請稍等…';
   const data=await request('/api/calendar/availability',payload);
   if(data.source==='google'&&settings){settings.calendar='Google Calendar 唯讀（最近查詢成功）';renderConfig();render()}
   target.innerHTML=`<p><b>${esc(data.summary)}</b></p>${data.checked_at?`<small>查詢時間：${esc(data.checked_at)} · 香港時間</small>`:''}<ol>${data.slots.map(slot=>`<li>${esc(slot.start.slice(0,10))} ${esc(slot.start.slice(11,16))}–${esc(slot.end.slice(11,16))} · ${esc(slot.reason)}${slot.evening?' · 晚場':''} · 待人工核實</li>`).join('')}</ol><p>${(data.notes||[]).map(esc).join('<br>')}</p>`;
@@ -81,5 +88,32 @@ $('calendarQueryBtn').onclick=async()=>{
 // Operational details are separate from the customer reply preview.
 function calendarInternal(data){
  const slots=(data.slots||[]).map(s=>`<li>${esc(s.start.slice(0,10))} ${esc(s.start.slice(11,16))}–${esc(s.end.slice(11,16))} · ${esc(s.reason)}${s.evening?' · 晚場':''}</li>`).join('');
- return `<details class="calendarform"><summary>內部核對：日曆結果與安排提醒</summary><p>${esc(data.summary)}</p>${data.checked_at?`<p>查詢快照：${esc(data.checked_at)} · 香港時間</p>`:''}<ol>${slots}</ol><p>${(data.notes||[]).map(esc).join('<br>')}</p><p>登記紀錄尚未核對，未建立或保留預約；以下候選為替代選項。</p></details>`;
+ return `<details class="calendarform"><summary>內部核對：日曆結果與安排提醒</summary><p>${esc(data.summary)}</p>${data.understanding?`<p>識別：${esc(data.understanding.intent)} · ${esc(data.understanding.provider)}<br>${(data.understanding.notes||[]).map(esc).join('<br>')}</p>`:''}${data.checked_at?`<p>查詢快照：${esc(data.checked_at)} · 香港時間</p>`:''}<ol>${slots}</ol><p>${(data.notes||[]).map(esc).join('<br>')}</p><p>登記紀錄尚未核對，未建立或保留預約；以下候選為替代選項。</p></details>`;
 }
+
+function applyUnderstanding(data){
+ $('calendarResult').textContent='';
+ const q=data.schedule,f=data.fields||{};
+ $('pickupAt').value=f.pickup_date&&f.pickup_time?f.pickup_date+'T'+f.pickup_time:'';
+ $('completionDate').value=f.completion_date||'';
+ $('calendarDate').value=q?.start_date||f.inspection_date||f.pickup_date||f.completion_date||'';
+ $('calendarDays').value=String(q?.days||7);
+ if(q?.days&&!['1','2','7','14'].includes(String(q.days))){const o=new Option(q.days+'天',String(q.days));$('calendarDays').add(o)}
+ if(q?.days)$('calendarDays').value=String(q.days);
+ $('inspectionDuration').value=String(q?.duration_minutes||data.duration_minutes||180);
+ $('calendarPreference').value=q?.preference||data.preference||'any';
+ $('weekdayEvening').checked=!!q?.include_weekday_evening;
+ $('planCompletion').checked=!!q?.plan_from_completion;
+ $('weekendOnly').checked=!!q?.weekend_only;
+ const names={availability:'驗樓空位',completion_advice:'成交日／領匙規劃',reschedule:'改期，交人工',cancel:'取消，交人工',other:'其他問題'};
+ $('intentResult').innerHTML=`<p><b>識別：${esc(names[data.intent]||data.intent)}</b> · ${esc(data.provider==='deepseek'?'DeepSeek':'本地規則')}</p><p>${(data.questions||[]).map(esc).join('<br>')}</p><p>${(data.notes||[]).map(esc).join('<br>')}</p>${q?'<p>已自動填入條件；發送測試時Worker會重新識別並查詢最新日曆。</p>':'<p>暫不查日曆；先追問或轉人工。請勿把上次表單當成本次條件。</p>'}`;
+}
+$('interpretBtn').onclick=async()=>{
+ if(!api){toast('請先連接Python後端');return}
+ const text=$('message').value.trim();if(!text){toast('先輸入客人訊息');return}
+ $('interpretBtn').disabled=true;const contact=$('contact').value;
+ try{const data=await request('/api/intent/interpret',{message:text,contact_id:contact,reset_context:$('resetContext').checked});if(text!==$('message').value.trim()||contact!==$('contact').value){toast('訊息已更改，請重新識別');return}applyUnderstanding(data);$('useCalendar').checked=false}
+ catch(e){$('intentResult').textContent='識別未完成：'+e.message}
+ finally{$('interpretBtn').disabled=false}
+};
+for(const id of ['calendarDate','calendarDays','inspectionDuration','pickupAt','completionDate','calendarPreference','weekdayEvening','planCompletion','weekendOnly'])$(id).addEventListener('change',()=>{$('useCalendar').checked=true;$('intentResult').textContent='已切換人工覆寫；發送時以目前表單為準。'});

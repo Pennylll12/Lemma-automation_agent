@@ -2,6 +2,10 @@
 
 可執行的 Python FastAPI + SQLite + 獨立背景 Worker，以及繁體中文工作台。
 
+## 自動識別與Google Calendar
+
+Google模式下可直接輸入客人訊息，自動識別意圖並回填查詢條件；成交日先查空位再倒推領匙建議。操作、已支援句式、工作天假設及測試樣本見[意圖識別與規劃指南](docs/INTENT_AND_PLANNING.md)。
+
 ## Google Calendar 唯讀查詢
 
 已加入真實Google日曆忙碌查詢、工作台日期／領匙／需時表單，以及依規則產生的候選時段。設定及驗收步驟見 [Google Calendar設定指南](docs/GOOGLE_CALENDAR.md)。需要你自行配置Google Service Account及分享指定日曆，尚未在本帳戶完成真實日曆端到端驗收。
@@ -104,7 +108,7 @@ python -m backend.app worker
 
 模型名稱範例與 Python fallback 統一為 `deepseek-flash`（2026-11-02 核對 [DeepSeek 官方文件](https://api-docs.deepseek.com/quick_start/pricing/)）。
 
-設定 `AI_PROVIDER=deepseek`、`DEEPSEEK_API_KEY` 及帳戶實際支援的 `DEEPSEEK_MODEL`，重啟 API／Worker。mock日曆模式傳送已遮蓋訊息及同客人最近四個先前回合，固定時段不代表真實查詢。Google模式則只讓DeepSeek根據當前已遮蓋訊息選擇固定語氣；日期及時段由後端查詢日曆後組裝。
+設定 `AI_PROVIDER=deepseek`、`DEEPSEEK_API_KEY` 及帳戶實際支援的 `DEEPSEEK_MODEL`，重啟 API／Worker。mock日曆模式傳送已遮蓋訊息及同客人最近四個先前回合，固定時段不代表真實查詢。Google自動模式由DeepSeek提取當前已遮蓋訊息的意圖及原文日期片段，後端核對並換算；沒有key或提取失敗時以本地規則處理。人工覆寫模式則只選固定語氣。所有空位由後端查日曆後組裝。
 
 只有在確認供應商適用 API 條款、資料保存及處理安排後才可考慮傳真實客戶資料。本版不處理附件、付款或銀行流水。
 
@@ -158,6 +162,7 @@ python -m backend.app worker
 | GET | /health | 無 | 健康檢查 |
 | GET | /api/config | Admin Bearer | 安全設定摘要，不傳回 secrets |
 | GET | /api/jobs | Admin Bearer | 最近100筆任務及日誌 |
+| POST | /api/intent/interpret | Admin Bearer | 識別意圖並產生表單條件／追問，不查日曆 |
 | POST | /api/calendar/availability | Admin Bearer | 唯讀查Google日曆候選，不建立預約 |
 | POST | /api/test/messages | Admin Bearer | 只測試、不發外部訊息 |
 | POST | /api/jobs/{id}/retry | Admin Bearer | 只重試 failed 且未開始發送任務 |
