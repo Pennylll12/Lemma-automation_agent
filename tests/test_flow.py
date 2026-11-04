@@ -139,6 +139,30 @@ def test_webhook_rejects_future_and_milliseconds(client):
     assert client.post('/webhooks/sleekflow',headers=h,json=normalized(timestamp=time.time()*1000)).status_code==422
 
 
+@pytest.mark.parametrize('body,expected', [
+    ({}, 'Missing required fields:'),
+    (normalized(message_id='', message='private-customer-text'), 'Fields must be non-empty strings: message_id'),
+    (normalized(timestamp='private-invalid-time'), 'timestamp must be original Unix seconds'),
+])
+def test_webhook_rejection_logs_reason_without_payload(client, caplog, body, expected):
+    with caplog.at_level('WARNING', logger='uvicorn.error'):
+        response=client.post('/webhooks/sleekflow',headers={'X-Webhook-Secret':'test-webhook'},json=body)
+    assert response.status_code==422
+    assert expected in response.json()['detail']
+    assert expected in caplog.text
+    assert 'private-customer-text' not in caplog.text
+    assert 'private-invalid-time' not in caplog.text
+    assert 'test-webhook' not in caplog.text
+
+
+def test_webhook_invalid_json_logs_position_without_body(client, caplog):
+    with caplog.at_level('WARNING', logger='uvicorn.error'):
+        response=client.post('/webhooks/sleekflow',headers={'X-Webhook-Secret':'test-webhook'},content='{"message":"private-customer-text"oops}')
+    assert response.status_code==422
+    assert 'Invalid JSON at line 1, column' in caplog.text
+    assert 'private-customer-text' not in caplog.text
+
+
 def test_masks_common_pii_before_storage(client):
     add(client,message='我叫陳小姐，電話91234567，A座1201室，a@example.com')
     j=client.get('/api/jobs').json()['jobs'][0]

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -547,33 +548,44 @@ def inbound_timestamp(value):
     return ts
 
 
+def reject_webhook(detail):
+    # Callers supply fixed explanations and known field names only, never payload values.
+    logging.getLogger('uvicorn.error').warning('SleekFlow webhook rejected (422): %s', detail)
+    raise HTTPException(422, detail)
+
+
 @app.post('/webhooks/sleekflow')
 async def webhook(request:Request,x_webhook_secret:str=Header(default="")):
     if not secure_equal(x_webhook_secret,WEBHOOK_SECRET): raise HTTPException(401,"Invalid webhook secret")
     raw=await request.body()
     if len(raw)>65536: raise HTTPException(413,"Payload too large")
     try: b=json.loads(raw)
-    except ValueError: raise HTTPException(422,"Invalid JSON")
+    except json.JSONDecodeError as exc:
+        reject_webhook(f'Invalid JSON at line {exc.lineno}, column {exc.colno}; check raw body and variable escaping')
+    except UnicodeDecodeError:
+        reject_webhook('Body must be UTF-8 JSON')
     # Explicit contract: configure Flow HTTP body to these fields. This is NOT an assumed native webhook schema.
     required={'message_id','contact_id','message','channel','timestamp','direction'}
-    if not isinstance(b,dict) or not required.issubset(b): raise HTTPException(422,"Use the documented normalized webhook contract")
+    if not isinstance(b,dict): reject_webhook('Body must be a JSON object')
+    if not required.issubset(b): reject_webhook('Missing required fields: '+', '.join(sorted(required-set(b))))
     if b['direction']!='inbound': return {"ignored":True,"reason":"outgoing"}
-    if not all(isinstance(b[k],str) and b[k] for k in ['message_id','contact_id','message','channel']): raise HTTPException(422,"Invalid fields")
+    invalid=[k for k in ['message_id','contact_id','message','channel'] if not isinstance(b[k],str) or not b[k].strip()]
+    if invalid: reject_webhook('Fields must be non-empty strings: '+', '.join(invalid))
     phone=re.sub(r'\D','',b['contact_id'])
     if phone not in ALLOWLIST: return {"ignored":True,"reason":"not_allowlisted"}
     try:
         ts=inbound_timestamp(b['timestamp'])
     except (ValueError,TypeError,OverflowError):
-        raise HTTPException(422,"timestamp must be original Unix seconds or ISO 8601 with timezone; do not use milliseconds or formatted local dates") from None
+        reject_webhook('timestamp must be original Unix seconds or ISO 8601 with timezone; do not use milliseconds or formatted local dates')
     # Bound received timestamp to server arrival, and reject reused IDs with different data.
     schedule = None
     if b.get('schedule') is not None:
         try:
             schedule = calendar.AvailabilityRequest.model_validate(b['schedule']).model_dump(mode='json')
         except ValidationError:
-            raise HTTPException(422, 'Invalid schedule fields; use the documented calendar contract') from None
+            reject_webhook('Invalid schedule fields; use the documented calendar contract')
     reset = b.get('reset_context',False)
-    if not isinstance(reset,bool): raise HTTPException(422,'reset_context must be boolean')
+    if not isinstance(reset,bool): reject_webhook('reset_context must be boolean')
     return enqueue(b['message_id'],phone,b['message'],b['channel'],min(ts,time.time()),"webhook",schedule=schedule,reset_context=reset)
 
 
