@@ -531,6 +531,22 @@ def test_audit_email():
     finally: audit.close(run,context)
 
 
+def inbound_timestamp(value):
+    """Preserve the original message time; never guess a missing timezone."""
+    if isinstance(value,bool): raise ValueError()
+    if isinstance(value,(int,float)):
+        ts=float(value)
+    elif isinstance(value,str) and len(value)<=128:
+        try: ts=float(value)
+        except ValueError:
+            parsed=datetime.fromisoformat(value.strip().replace('Z','+00:00'))
+            if parsed.tzinfo is None or parsed.utcoffset() is None: raise ValueError()
+            ts=parsed.timestamp()
+    else: raise ValueError()
+    if not 0<ts<=time.time()+60: raise ValueError()
+    return ts
+
+
 @app.post('/webhooks/sleekflow')
 async def webhook(request:Request,x_webhook_secret:str=Header(default="")):
     if not secure_equal(x_webhook_secret,WEBHOOK_SECRET): raise HTTPException(401,"Invalid webhook secret")
@@ -546,9 +562,9 @@ async def webhook(request:Request,x_webhook_secret:str=Header(default="")):
     phone=re.sub(r'\D','',b['contact_id'])
     if phone not in ALLOWLIST: return {"ignored":True,"reason":"not_allowlisted"}
     try:
-        ts=float(b['timestamp'])
-        if not 0<ts<=time.time()+60: raise ValueError()
-    except (ValueError,TypeError): raise HTTPException(422,"timestamp must be Unix seconds, not milliseconds")
+        ts=inbound_timestamp(b['timestamp'])
+    except (ValueError,TypeError,OverflowError):
+        raise HTTPException(422,"timestamp must be original Unix seconds or ISO 8601 with timezone; do not use milliseconds or formatted local dates") from None
     # Bound received timestamp to server arrival, and reject reused IDs with different data.
     schedule = None
     if b.get('schedule') is not None:

@@ -1,5 +1,11 @@
 # 匯入驗證紀錄 — 2026-11-02
 
+## SleekFlow原始時間兼容 — 2026-11-04
+
+- 125項pytest通過。新增Unix秒數字串、UTC ISO及時區偏移ISO接收測試，核對原訊息時間不被改成接收時間。
+- 拒絕缺少時區、日/月顯示格式、毫秒、布林、空值、無效值及未來時間；過期ISO訊息仍被24小時窗口阻擋。
+- 本機HTTP測試，未在SleekFlow帳戶執行真實端到端測試；需核對變數展開後的實際值。
+
 ## 執行日誌及管理員郵件 — 2026-11-04
 
 - 本機隔離Python3.13環境從原requirements-lock.txt安裝依賴，114項pytest通過；保留原Starlette TestClient棄用警告。pip依賴、JavaScript語法及diff檢查通過。本次未改鎖定依賴。

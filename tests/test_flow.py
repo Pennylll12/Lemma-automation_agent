@@ -185,3 +185,34 @@ def test_separate_worker_process_and_persistence(client):
     # A fresh connection after process exit reads the same persisted result.
     with m.db() as c:
         assert c.execute('SELECT status FROM jobs').fetchone()[0]=='simulated'
+
+
+@pytest.mark.parametrize('style',['utc','offset','numeric_string'])
+def test_webhook_accepts_original_timestamp_formats_and_preserves_window(client,style):
+    from datetime import datetime,timezone,timedelta
+    original=time.time()-3600
+    stamp=str(original) if style=='numeric_string' else datetime.fromtimestamp(original,
+        timezone.utc if style=='utc' else timezone(timedelta(hours=8))).isoformat()
+    if style=='utc':stamp=stamp.replace('+00:00','Z')
+    r=client.post('/webhooks/sleekflow',headers={'X-Webhook-Secret':'test-webhook'},json=normalized(timestamp=stamp))
+    assert r.status_code==200 and r.json()['accepted']
+    with m.db() as db:
+        assert db.execute('SELECT last_inbound FROM contacts').fetchone()[0]==pytest.approx(original,abs=0.001)
+
+
+@pytest.mark.parametrize('value',['04/11/2026 12:30','2026-11-04T12:30:00',True,None,{},'NaN','inf'])
+def test_webhook_rejects_ambiguous_or_invalid_timestamp(client,value):
+    r=client.post('/webhooks/sleekflow',headers={'X-Webhook-Secret':'test-webhook'},json=normalized(timestamp=value))
+    assert r.status_code==422
+    assert not client.get('/api/jobs').json()['jobs']
+
+
+def test_webhook_rejects_future_iso_and_expired_iso_does_not_extend_window(client):
+    from datetime import datetime,timezone
+    future=datetime.fromtimestamp(time.time()+120,timezone.utc).isoformat()
+    h={'X-Webhook-Secret':'test-webhook'}
+    assert client.post('/webhooks/sleekflow',headers=h,json=normalized(timestamp=future)).status_code==422
+    expired=datetime.fromtimestamp(time.time()-90000,timezone.utc).isoformat()
+    assert client.post('/webhooks/sleekflow',headers=h,json=normalized(timestamp=expired)).status_code==200
+    run()
+    assert client.get('/api/jobs').json()['jobs'][0]['status']=='window_closed'

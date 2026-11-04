@@ -137,7 +137,7 @@ python -m backend.app worker
 }
 ```
 
-`timestamp` 必須為客人該則訊息的 Unix 秒數，不能用流程執行時間或毫秒。`contact_id` 在這條 webhook contract 指客人電話，會標準化為純數字及核對白名單。原生 webhook 若欄位不同，需要依實際 payload 寫 mapping；本端點不直接假設相容。範例時間為固定示例，測試時請換成真正訊息時間。
+`timestamp` 必須為客人該則訊息的原始時間：接受Unix秒數或附時區的ISO 8601（例如`2026-11-04T12:30:00Z`或`2026-11-04T20:30:00+08:00`）。不能用流程執行時間、毫秒、沒有時區的日期或`日/月/年 時:分`顯示字串。SleekFlow可直接映射原始`created_at`，移除`convert_to_company_time_zone`及`date.to_string`；實際展開值仍需核對符合上述格式。`contact_id` 在這條 webhook contract 指客人電話，會標準化為純數字及核對白名單。原生 webhook 若欄位不同，需要依實際 payload 寫 mapping；本端點不直接假設相容。範例時間為固定示例，測試時請換成真正訊息時間。
 
 先保持 `LIVE_SEND_ENABLED=false` 測通。確認後填入 Send Message 官方文件核實的：
 
