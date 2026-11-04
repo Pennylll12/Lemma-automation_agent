@@ -13,6 +13,7 @@ import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qsl
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -23,6 +24,7 @@ from pydantic import BaseModel, Field, ValidationError
 from backend import calendar_service as calendar
 from backend import intent_service as intents
 from backend import audit_service as audit
+from backend import reply_webhook
 
 DB = os.getenv("DATABASE_PATH", "data/flow.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
@@ -92,6 +94,10 @@ def init_db():
                 c.execute(f'ALTER TABLE jobs ADD COLUMN {name} TEXT')
         if 'reset_context' not in columns:
             c.execute('ALTER TABLE jobs ADD COLUMN reset_context INTEGER NOT NULL DEFAULT 0')
+        if 'received_at' not in columns:
+            c.execute('ALTER TABLE jobs ADD COLUMN received_at REAL')
+        if 'time_source' not in columns:
+            c.execute('ALTER TABLE jobs ADD COLUMN time_source TEXT')
 
 
 def event(c, job_id, kind, detail):
@@ -127,7 +133,7 @@ class Input(BaseModel):
     reset_context: bool = False
 
 
-def enqueue(message_id, contact, message, channel, ts, mode, fail=False, schedule=None, reset_context=False):
+def enqueue(message_id, contact, message, channel, ts, mode, fail=False, schedule=None, reset_context=False, time_source='provided'):
     now = time.time()
     schedule_json = json.dumps(schedule, sort_keys=True, ensure_ascii=False) if schedule is not None else None
     if not message_id or len(message_id) > 150 or not contact or len(contact) > 150 or len(message) > 4000:
@@ -143,10 +149,12 @@ def enqueue(message_id, contact, message, channel, ts, mode, fail=False, schedul
         human = c.execute("SELECT human FROM contacts WHERE id=?", (contact,)).fetchone()[0]
         status = "handoff" if human else "queued"
         n = c.execute("""INSERT OR IGNORE INTO jobs
-            (id,contact_id,message,channel,created,updated,status,fail_once,mode,schedule,reset_context)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (message_id,contact,redact(message),channel,now,now,status,int(fail),mode,schedule_json,int(reset_context))).rowcount
+            (id,contact_id,message,channel,created,updated,status,fail_once,mode,schedule,reset_context,received_at,time_source)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (message_id,contact,redact(message),channel,now,now,status,int(fail),mode,schedule_json,int(reset_context),ts,time_source)).rowcount
         if n:
             event(c,message_id,"received","已持久保存；個資規則已套用（非完整匿名保證）")
+            if time_source=='server_received':
+                event(c,message_id,'received_time','日期識別採後端接收時間（香港）：'+datetime.fromtimestamp(ts,calendar.HK).isoformat()+'；不是原始 WhatsApp 發訊時間')
             if human:
                 event(c,message_id,"handoff","此聯絡人已由人工接管")
         result={"id":message_id,"duplicate":not bool(n),"accepted":True}
@@ -246,7 +254,7 @@ async def answer(j):
             update_job(j,resolved_schedule=query.model_dump_json())
             result = await calendar.lookup(query)
         else:
-            understanding = await understand(j['message'], j['contact_id'], j['created'], j.get('reset_context',False), j['id'])
+            understanding = await understand(j['message'], j['contact_id'], j.get('received_at') or j['created'], j.get('reset_context',False), j['id'])
             audit.record('intent',understanding)
             update_job(j,understanding=json.dumps(understanding,ensure_ascii=False),intent=understanding['intent'])
             if understanding['schedule']:
@@ -330,6 +338,8 @@ def render_template(value, fields):
 
 
 async def deliver(j, reply):
+    callback=j['mode']=='webhook' and reply_webhook.enabled()
+    live=j['mode']=='webhook' and os.getenv("LIVE_SEND_ENABLED","false").lower()=="true"
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         contact=c.execute("SELECT * FROM contacts WHERE id=?",(j['contact_id'],)).fetchone()
@@ -341,17 +351,32 @@ async def deliver(j, reply):
             return
         if time.time()-contact['last_inbound']>=86400:
             c.execute("UPDATE jobs SET status='window_closed',updated=? WHERE id=?",(time.time(),j['id']))
-            event(c,j['id'],"window_closed","24 小時窗口已關閉；未設定範本，不發送")
+            event(c,j['id'],"window_closed","已超過本系統記錄的接收時間24小時，停止提交；真實WhatsApp窗口仍須由SleekFlow核對")
             return
         if c.execute("SELECT 1 FROM outbox WHERE job_id=?",(j['id'],)).fetchone():
             c.execute("UPDATE jobs SET status='needs_review',updated=? WHERE id=?",(time.time(),j['id']))
             return
+        callback_request=None
+        if callback:
+            if live:
+                raise reply_webhook.ReplyWebhookConfigError('請只選一種發送途徑：回覆Webhook啟用時，LIVE_SEND_ENABLED必須為false；未提交回覆')
+            if j['contact_id'] not in ALLOWLIST:
+                raise reply_webhook.ReplyWebhookConfigError('此電話不在Worker目前的測試白名單，未提交回覆')
+            # Validate before reserving the outbox: configuration errors are safe to retry.
+            callback_request=reply_webhook.request_data(j,reply,time.time())
         c.execute("INSERT INTO outbox(job_id,state,updated) VALUES(?,'sending',?)",(j['id'],time.time()))
     # Test jobs NEVER send to WhatsApp, even when live sending is enabled.
-    live=j['mode']=='webhook' and os.getenv("LIVE_SEND_ENABLED","false").lower()=="true"
     provider_id=None
     try:
-        if live:
+        if callback:
+            url,headers,body=callback_request
+            audit.record('delivery',{'route':'sleekflow_reply_webhook','state':'submitting','event_id':body['event_id']})
+            async with httpx.AsyncClient(timeout=20,follow_redirects=False) as client:
+                response=await client.post(url,headers=headers,json=body)
+                audit.record('delivery',{'route':'sleekflow_reply_webhook','http_status':response.status_code})
+                response.raise_for_status()
+            provider_id=body['event_id']
+        elif live:
             url=os.getenv("SLEEKFLOW_SEND_URL","")
             header=os.getenv("SLEEKFLOW_AUTH_HEADER","")
             auth=os.getenv("SLEEKFLOW_AUTH_VALUE","")
@@ -364,17 +389,19 @@ async def deliver(j, reply):
                 response.raise_for_status()
             # HTTP success records acceptance only, never claims WhatsApp delivery.
             provider_id="http-accepted"
-        state="accepted" if live else "simulated"
+        state="callback_accepted" if callback else "accepted" if live else "simulated"
         with db() as c:
             c.execute("UPDATE outbox SET state=?,provider_id=?,updated=? WHERE job_id=?",(state,provider_id,time.time(),j['id']))
             c.execute("UPDATE jobs SET status=?,stage=4,updated=? WHERE id=?",(state,time.time(),j['id']))
-            event(c,j['id'],state,"SleekFlow API 已接受；尚未驗證送達" if live else "只保存模擬回覆，沒有發送 WhatsApp")
+            event(c,j['id'],state,"SleekFlow回覆Webhook已接受；由第二個Flow處理WhatsApp發送，尚未驗證送達" if callback else "SleekFlow API 已接受；尚未驗證送達" if live else "只保存模擬回覆，沒有發送 WhatsApp")
+        audit.record('delivery',{'route':'sleekflow_reply_webhook' if callback else 'direct_api' if live else 'simulation','state':state})
     except Exception:
         # A timed-out send may have succeeded: never automatically resend it.
         with db() as c:
             c.execute("UPDATE outbox SET state='unknown',updated=? WHERE job_id=?",(time.time(),j['id']))
             c.execute("UPDATE jobs SET status='needs_review',error='發送結果未確認，請先在 SleekFlow 核對；不可直接重送',updated=? WHERE id=?",(time.time(),j['id']))
             event(c,j['id'],"needs_review","發送未確認；停止自動重試，避免重複訊息")
+        audit.record('delivery',{'route':'sleekflow_reply_webhook' if callback else 'direct_api','state':'unknown','note':'請在SleekFlow核對，禁止自動重送'})
 
 
 async def process_one():
@@ -384,6 +411,8 @@ async def process_one():
     audit.record('input',{'masked_message':j['message'],'mode':j['mode'],
         'contact_ref':hashlib.sha256(j['contact_id'].encode()).hexdigest()[:12],
         'manual_schedule':json.loads(j['schedule']) if j.get('schedule') else None,
+        'received_at':datetime.fromtimestamp(j.get('received_at') or j['created'],calendar.HK).isoformat(),
+        'time_source':j.get('time_source') or 'legacy',
         'reset_context':bool(j.get('reset_context'))})
     audit.save(db,run,DB)
     audit.watch(run,lambda:audit.save(db,run,DB))
@@ -392,7 +421,7 @@ async def process_one():
         await deliver(j,reply)
     except Exception as exc:
         # Do not persist raw provider bodies/headers: these can contain secrets.
-        update_job(j,status="failed",error=str(exc) if isinstance(exc, calendar.CalendarError) else "測試故障，或外部服務呼叫失敗（"+type(exc).__name__+"）")
+        update_job(j,status="failed",error=str(exc) if isinstance(exc, (calendar.CalendarError,reply_webhook.ReplyWebhookConfigError)) else "測試故障，或外部服務呼叫失敗（"+type(exc).__name__+"）")
         with db() as c: event(c,j['id'],"failed","處理失敗；可人工重試，尚未發送")
     finally:
         try:
@@ -441,6 +470,8 @@ def config():
         "ai_provider":"deepseek" if os.getenv('DEEPSEEK_API_KEY') and os.getenv('AI_PROVIDER')=='deepseek' else "mock",
         "live_send":os.getenv('LIVE_SEND_ENABLED','false')=='true',"calendar":"Google Calendar 唯讀（未驗證連線）" if calendar.mode()=="google" else "固定測試空位",
         "calendar_config":calendar.safe_config(),"allowlist_count":len(ALLOWLIST),
+        "webhook_time_source":"server_received",
+        "reply_webhook":{"enabled":reply_webhook.enabled()},
         "audit_email":{"enabled":os.getenv('AUDIT_EMAIL_ENABLED','false').lower()=='true',
             "configured":bool(os.getenv('SMTP_USER') and os.getenv('SMTP_PASSWORD') and os.getenv('SMTP_FROM') and os.getenv('ADMIN_EMAIL_TO'))}}
 
@@ -532,22 +563,6 @@ def test_audit_email():
     finally: audit.close(run,context)
 
 
-def inbound_timestamp(value):
-    """Preserve the original message time; never guess a missing timezone."""
-    if isinstance(value,bool): raise ValueError()
-    if isinstance(value,(int,float)):
-        ts=float(value)
-    elif isinstance(value,str) and len(value)<=128:
-        try: ts=float(value)
-        except ValueError:
-            parsed=datetime.fromisoformat(value.strip().replace('Z','+00:00'))
-            if parsed.tzinfo is None or parsed.utcoffset() is None: raise ValueError()
-            ts=parsed.timestamp()
-    else: raise ValueError()
-    if not 0<ts<=time.time()+60: raise ValueError()
-    return ts
-
-
 def reject_webhook(detail):
     # Callers supply fixed explanations and known field names only, never payload values.
     logging.getLogger('uvicorn.error').warning('SleekFlow webhook rejected (422): %s', detail)
@@ -556,16 +571,30 @@ def reject_webhook(detail):
 
 @app.post('/webhooks/sleekflow')
 async def webhook(request:Request,x_webhook_secret:str=Header(default="")):
+    received_at=time.time()
     if not secure_equal(x_webhook_secret,WEBHOOK_SECRET): raise HTTPException(401,"Invalid webhook secret")
     raw=await request.body()
     if len(raw)>65536: raise HTTPException(413,"Payload too large")
-    try: b=json.loads(raw)
+    content_type=request.headers.get('content-type','application/json').split(';',1)[0].strip().lower()
+    try:
+        if content_type=='application/x-www-form-urlencoded':
+            fields=parse_qsl(raw.decode('utf-8'),keep_blank_values=True,encoding='utf-8',errors='strict',max_num_fields=32)
+            b=dict(fields)
+            if len(b)!=len(fields): reject_webhook('Duplicate form field names are not allowed')
+            if 'schedule' in b: b['schedule']=json.loads(b['schedule'])
+            if 'reset_context' in b:
+                if b['reset_context'] not in ('true','false'): reject_webhook('reset_context must be true or false')
+                b['reset_context']=b['reset_context']=='true'
+        elif content_type=='application/json': b=json.loads(raw)
+        else: raise HTTPException(415,'Use application/json or application/x-www-form-urlencoded')
     except json.JSONDecodeError as exc:
         reject_webhook(f'Invalid JSON at line {exc.lineno}, column {exc.colno}; check raw body and variable escaping')
     except UnicodeDecodeError:
-        reject_webhook('Body must be UTF-8 JSON')
+        reject_webhook('Body must use UTF-8 encoding')
+    except ValueError:
+        reject_webhook('Invalid form encoding or too many fields')
     # Explicit contract: configure Flow HTTP body to these fields. This is NOT an assumed native webhook schema.
-    required={'message_id','contact_id','message','channel','timestamp','direction'}
+    required={'message_id','contact_id','message','channel','direction'}
     if not isinstance(b,dict): reject_webhook('Body must be a JSON object')
     if not required.issubset(b): reject_webhook('Missing required fields: '+', '.join(sorted(required-set(b))))
     if b['direction']!='inbound': return {"ignored":True,"reason":"outgoing"}
@@ -573,11 +602,7 @@ async def webhook(request:Request,x_webhook_secret:str=Header(default="")):
     if invalid: reject_webhook('Fields must be non-empty strings: '+', '.join(invalid))
     phone=re.sub(r'\D','',b['contact_id'])
     if phone not in ALLOWLIST: return {"ignored":True,"reason":"not_allowlisted"}
-    try:
-        ts=inbound_timestamp(b['timestamp'])
-    except (ValueError,TypeError,OverflowError):
-        reject_webhook('timestamp must be original Unix seconds or ISO 8601 with timezone; do not use milliseconds or formatted local dates')
-    # Bound received timestamp to server arrival, and reject reused IDs with different data.
+    # Upstream timestamp is deliberately ignored. A duplicate must not refresh receipt time.
     schedule = None
     if b.get('schedule') is not None:
         try:
@@ -586,7 +611,7 @@ async def webhook(request:Request,x_webhook_secret:str=Header(default="")):
             reject_webhook('Invalid schedule fields; use the documented calendar contract')
     reset = b.get('reset_context',False)
     if not isinstance(reset,bool): reject_webhook('reset_context must be boolean')
-    return enqueue(b['message_id'],phone,b['message'],b['channel'],min(ts,time.time()),"webhook",schedule=schedule,reset_context=reset)
+    return enqueue(b['message_id'],phone,b['message'],b['channel'],received_at,"webhook",schedule=schedule,reset_context=reset,time_source='server_received')
 
 
 @app.get('/api/jobs',dependencies=[Depends(admin)])

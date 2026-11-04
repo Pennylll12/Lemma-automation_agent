@@ -2,6 +2,10 @@
 
 可執行的 Python FastAPI + SQLite + 獨立背景 Worker，以及繁體中文工作台。
 
+## SleekFlow 入訊與回覆串接
+
+入訊不再要求 `timestamp`，日期識別改用後端接收時間（香港）；支援表單欄位傳輸，保留客人訊息換行及引號。新增把回覆 POST 到第二個 SleekFlow Flow 的功能，再由 SleekFlow 向測試電話發 WhatsApp。設定、接收欄位、完整回傳範例及驗收見 [SleekFlow Webhook 串接指南](docs/SLEEKFLOW_WEBHOOK.md)。回傳預設關閉，未配置真實 URL／Token，也未執行真實 WhatsApp 發送。
+
 ## 執行日誌與管理員通知
 
 每次任務及重試保存輸入、意圖、查詢條件、Google忙碌區間、逐場排除原因及回覆。工作台可讀中文報告及下載JSON；配置SMTP後可每次寄管理員通知。詳見[日誌與郵件設定](docs/AUDIT_AND_ADMIN_EMAIL.md)。郵件預設關閉，WhatsApp設定獨立。
@@ -123,7 +127,7 @@ python -m backend.app worker
 - Method: POST
 - URL: `https://your-backend.example.com/webhooks/sleekflow`
 - Header: `X-Webhook-Secret` 為 `.env` 裏的 `WEBHOOK_SECRET`
-- Content-Type: application/json
+- Content-Type: application/json（相容原有流程）；多行訊息建議改用 `application/x-www-form-urlencoded`，見上方指南。
 - Body: 從實際事件動態選擇對應值，映射到以下 schema。不要把範例 message_id 當常數。
 
 ```json
@@ -132,22 +136,23 @@ python -m backend.app worker
   "contact_id": "85290000001",
   "message": "星期六有冇驗樓位？",
   "channel": "original-channel-reference",
-  "timestamp": 1793606400,
   "direction": "inbound"
 }
 ```
 
-`timestamp` 必須為客人該則訊息的原始時間：接受Unix秒數或附時區的ISO 8601（例如`2026-11-04T12:30:00Z`或`2026-11-04T20:30:00+08:00`）。不能用流程執行時間、毫秒、沒有時區的日期或`日/月/年 時:分`顯示字串。SleekFlow可直接映射原始`created_at`，移除`convert_to_company_time_zone`及`date.to_string`；實際展開值仍需核對符合上述格式。`contact_id` 在這條 webhook contract 指客人電話，會標準化為純數字及核對白名單。原生 webhook 若欄位不同，需要依實際 payload 寫 mapping；本端點不直接假設相容。範例時間為固定示例，測試時請換成真正訊息時間。
+`timestamp` 不再必填，即使傳入也會忽略。Python 記錄後端接收時間，香港日期用於相對日期識別；這不是客人原始發訊時間，也不能證明真實WhatsApp窗口有效。`contact_id` 在這條 webhook contract 指客人電話，會標準化為純數字及核對白名單。原生 webhook 若欄位不同，需要依實際 payload 寫 mapping；本端點不直接假設相容。
 
-先保持 `LIVE_SEND_ENABLED=false` 測通。確認後填入 Send Message 官方文件核實的：
+**推薦使用回覆 Webhook 路徑**：配置 `SLEEKFLOW_REPLY_WEBHOOK_URL`、`SLEEKFLOW_REPLY_WEBHOOK_HEADERS`，啟用 `SLEEKFLOW_REPLY_WEBHOOK_ENABLED=true`，並保持 `LIVE_SEND_ENABLED=false`。第二個 Flow 收到 `phone`、`reply` 後發訊；此回傳開關即使在 LIVE_SEND_ENABLED=false 時仍可觸發 WhatsApp。完整步驟見上方指南。兩條外送路徑不能同時啟用。
+
+以下為保留的直接 Send API 替代路徑，不與回覆 Webhook 同時使用。先保持 `LIVE_SEND_ENABLED=false` 測通。確認後填入 Send Message 官方文件核實的：
 
 - `SLEEKFLOW_SEND_URL`：HTTPS endpoint。
 - `SLEEKFLOW_AUTH_HEADER`／`SLEEKFLOW_AUTH_VALUE`：完整認證格式。
 - `SLEEKFLOW_BODY_TEMPLATE`：單行 JSON，正確欄位內使用 `{{recipient}}`、`{{channel}}`、`{{reply}}`。channel placeholder 是 normalized contract 傳入值，不自動把 channel ID 轉成電話或其他類型。
 
-本版不提供猜測出的 SleekFlow body 範本。使用 `Send HTTP request` 把訊息交後端後，**不要再另設一個 Send message 發相同答案**。後端採非同步發送；HTTP 接收成功不會自動發 WhatsApp。
+此直接 API 路徑不提供猜測出的 SleekFlow body 範本。使用時不要另外在 Flow B 再發相同答案。後端採非同步發送；HTTP 入訊接收成功不會自動發 WhatsApp。
 
-最後才設定 `LIVE_SEND_ENABLED=true` 並重啟，白名單仍然生效。SleekFlow HTTP 成功僅標記 `accepted`，不是已送達；需要送達 webhook 才可進一步核實。24 小時窗口已關閉會標記 `window_closed`，本版未自動選範本。
+僅使用直接 API 路徑時才設定 `LIVE_SEND_ENABLED=true` 並重啟，白名單仍然生效。直接 API 成功標記 `accepted`；回覆 Webhook 成功標記 `callback_accepted`，兩者都不是已送達。接收時間超過24小時會標記 `window_closed`；真實窗口仍須由SleekFlow確認，本版未自動選範本。
 
 ## 任務可靠性與已知邊界
 

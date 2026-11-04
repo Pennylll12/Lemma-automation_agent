@@ -1,6 +1,14 @@
 # 匯入驗證紀錄 — 2026-11-02
 
-## SleekFlow原始時間兼容 — 2026-11-04
+## 接收時間、表單入訊及回覆 Webhook — 2026-11-04
+
+- 145項pytest通過；JavaScript語法、pip依賴及diff格式檢查通過。保留原Starlette TestClient棄用警告，未新增依賴。
+- 按擁有者要求取代下方舊時間規則：timestamp不再必填／使用，存儲後端接收時間及來源；驗證忽略上游不合法／未來時間、重複訊息不更新時間、舊SQLite資料可新增欄位遷移。
+- 支援application/x-www-form-urlencoded；驗證多行、雙引號、加號及中文內容，仍保留密鑰／電話白名單／欄位驗證；無效JSON繼續拒絕。
+- 以HTTP測試替身驗證回傳JSON、固定event_id及Idempotency-Key、接受狀態、去重不重發、測試入口不外送、人工接管及接收時間過期阻擋、配置錯誤可安全重試、逾時／HTTP錯誤／轉址後不自動重發、Token與URL不進日誌。
+- 新回覆Webhook預設關閉。尚未取得或配置擁有者Flow B的實際URL／Header Token，未呼叫真實SleekFlow或發送WhatsApp。需依docs/SLEEKFLOW_WEBHOOK.md配置兩個Flow並驗收。
+
+## 歷史：SleekFlow原始時間兼容 — 2026-11-04（已由接收時間規則取代）
 
 - 125項pytest通過。新增Unix秒數字串、UTC ISO及時區偏移ISO接收測試，核對原訊息時間不被改成接收時間。
 - 拒絕缺少時區、日/月顯示格式、毫秒、布林、空值、無效值及未來時間；過期ISO訊息仍被24小時窗口阻擋。

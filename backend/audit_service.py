@@ -33,7 +33,8 @@ STAGES = {'input':'收到訊息','intent':'意圖及資料識別','query':'實�
           'calendar_http':'Google HTTP狀態','busy':'Google返回忙碌區間',
           'policy':'本次套用規則','candidates':'場次篩選結果','selection':'推薦方案及回覆',
           'result':'任務結果','model_request':'傳給DeepSeek的內容','model_response':'DeepSeek核對後回傳',
-          'model_failure':'模型備援處理','context':'日期基準與同客人上下文'}
+          'model_failure':'模型備援處理','context':'日期基準與同客人上下文',
+          'delivery':'回覆提交與防重複發送'}
 FIELDS={'start_date':'查詢起日','days':'查詢天數','duration_minutes':'預留分鐘',
         'pickup_at':'已確認領匙時間','completion_date':'成交日','preference':'時段偏好',
         'include_weekday_evening':'包含平日晚場','plan_from_completion':'由成交日規劃',
@@ -76,6 +77,7 @@ def close(run, context):
 def summary(run):
     status=run.get('status','running')
     titles={'simulated':'測試完成，未發WhatsApp','accepted':'WhatsApp API接受，未確認送達',
+            'callback_accepted':'SleekFlow回覆Webhook接受，未確認WhatsApp送達',
             'failed':'處理失敗','handoff':'人工接管','needs_review':'需要人工核對',
             'window_closed':'發送窗口已關閉','running':'尚未完成','ok':'預覽完成'}
     lines=['叻媽自動化執行報告',f"任務：{run.get('job_id') or '獨立預覽'}",
@@ -128,6 +130,10 @@ def summary(run):
         elif stage=='input':
             lines.append(data['masked_message'])
             lines.append('來源：'+data['mode']+'；'+('人工覆寫表單' if data.get('manual_schedule') else '自動識別'))
+            if data.get('received_at'):
+                lines.append('日期基準：'+data['received_at']+'；時間來源：'+data.get('time_source','legacy'))
+                if data.get('time_source')=='server_received':
+                    lines.append('採後端收到Webhook的時間；未驗證客人原始WhatsApp發訊時間。')
         elif stage=='model_request':
             lines.append('用途：'+data['purpose']+'；模型：'+data['model'])
             lines.append('已遮蓋訊息：'+data['masked_message'])
