@@ -17,9 +17,11 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field, ValidationError
 from backend import calendar_service as calendar
 from backend import intent_service as intents
+from backend import audit_service as audit
 
 DB = os.getenv("DATABASE_PATH", "data/flow.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
@@ -72,6 +74,12 @@ def init_db():
             at REAL NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS outbox (
             job_id TEXT PRIMARY KEY, state TEXT NOT NULL, provider_id TEXT, updated REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS audit_runs (
+            id TEXT PRIMARY KEY, job_id TEXT, attempt INTEGER NOT NULL, kind TEXT NOT NULL,
+            created REAL NOT NULL, finished REAL, status TEXT NOT NULL, data TEXT NOT NULL,
+            mail_state TEXT NOT NULL DEFAULT 'disabled', mail_error TEXT, file_error TEXT);
+        CREATE INDEX IF NOT EXISTS audit_job ON audit_runs(job_id,created);
+        CREATE INDEX IF NOT EXISTS audit_mail ON audit_runs(mail_state,created);
         """)
 
     # Additive migration preserves existing Codespaces jobs and outbox records.
@@ -140,7 +148,20 @@ def enqueue(message_id, contact, message, channel, ts, mode, fail=False, schedul
             event(c,message_id,"received","已持久保存；個資規則已套用（非完整匿名保證）")
             if human:
                 event(c,message_id,"handoff","此聯絡人已由人工接管")
-        return {"id":message_id,"duplicate":not bool(n),"accepted":True}
+        result={"id":message_id,"duplicate":not bool(n),"accepted":True}
+    if n and human: audit_terminal_job(message_id)
+    return result
+
+
+def audit_terminal_job(job_id):
+    with db() as c:
+        row=c.execute('SELECT id,message,mode,attempts,status,reply,error FROM jobs WHERE id=?',(job_id,)).fetchone()
+    run,context=audit.begin('job',job_id,row['attempts'])
+    try:
+        audit.record('input',{'masked_message':row['message'],'mode':row['mode']})
+        audit.record('result',{'status':row['status'],'reply':row['reply'],'error':row['error']})
+        audit.save(db,run,DB,status=row['status'])
+    finally: audit.close(run,context)
 
 
 def claim_job():
@@ -154,6 +175,14 @@ def claim_job():
             c.execute("UPDATE jobs SET status=?,claim=NULL,lease_until=NULL,updated=?,error=? WHERE id=?",
                 (status,now,"Worker lease expired; delivery requires review" if out else None,row['id']))
             event(c,row['id'],"recovery","租約過期；發送曾開始則交人工核對，否則重新入隊")
+            for trace in c.execute("SELECT id,data FROM audit_runs WHERE job_id=? AND status='running'",(row['id'],)).fetchall():
+                data=json.loads(trace['data'])
+                data.update(status='interrupted',finished=now)
+                data['steps'].append({'at':datetime.now(calendar.HK).isoformat(),'stage':'result',
+                    'data':{'status':'interrupted','error':'Worker租約過期；未完成的執行已交恢復流程核對'}})
+                mail='pending' if os.getenv('AUDIT_EMAIL_ENABLED','false').lower()=='true' else 'disabled'
+                c.execute('UPDATE audit_runs SET status=?,finished=?,data=?,mail_state=? WHERE id=?',
+                    ('interrupted',now,json.dumps(data,ensure_ascii=False),mail,trace['id']))
         row=c.execute("""SELECT j.* FROM jobs j JOIN contacts c ON c.id=j.contact_id
             WHERE j.status='queued' AND c.human=0
             AND NOT EXISTS (SELECT 1 FROM jobs p WHERE p.contact_id=j.contact_id
@@ -180,16 +209,20 @@ def update_job(j, **fields):
 async def understand(text, contact_id, received_at=None, reset_context=False, before_id=None):
     received_at = received_at or time.time()
     context = None
+    previous_job = None
     if not reset_context:
         with db() as c:
-            row = c.execute('''SELECT understanding,created FROM jobs WHERE contact_id=?
+            row = c.execute('''SELECT id,understanding,created FROM jobs WHERE contact_id=?
                 AND created>=? AND created<=?
                 AND rowid < COALESCE((SELECT rowid FROM jobs WHERE id=?), 9223372036854775807)
                 ORDER BY rowid DESC LIMIT 1''',
                 (contact_id,received_at-86400,received_at,before_id)).fetchone()
             if row and row['understanding']:
                 context = json.loads(row['understanding'])
+                previous_job = row['id']
     anchor = datetime.fromtimestamp(received_at,calendar.HK).date()
+    audit.record('context',{'reset_context':bool(reset_context),'available_previous_job':previous_job,
+        'anchor_date':anchor.isoformat(),'note':'只提供同客人24小時內資料；是否沿用見識別結果提醒'})
     return await intents.interpret(redact(text),anchor,context)
 
 
@@ -213,6 +246,7 @@ async def answer(j):
             result = await calendar.lookup(query)
         else:
             understanding = await understand(j['message'], j['contact_id'], j['created'], j.get('reset_context',False), j['id'])
+            audit.record('intent',understanding)
             update_job(j,understanding=json.dumps(understanding,ensure_ascii=False),intent=understanding['intent'])
             if understanding['schedule']:
                 query = calendar.AvailabilityRequest.model_validate(understanding['schedule'])
@@ -230,6 +264,8 @@ async def answer(j):
         if understanding:
             actual_provider = understanding['provider']
         if not understanding and provider == 'deepseek' and result['source'] == 'google':
+            audit.record('model_request',{'purpose':'人工覆寫模式：只選開場語，不傳送日曆結果','masked_message':text,
+                'model':os.getenv('DEEPSEEK_MODEL','deepseek-flash')})
             async with httpx.AsyncClient(timeout=45) as client:
                 res = await client.post('https://api.deepseek.com/chat/completions',
                     headers={'Authorization': 'Bearer ' + key},
@@ -242,10 +278,15 @@ async def answer(j):
             try:
                 greeting_id = json.loads(content).get('greeting_id')
                 opening = {1: '你好呀！', 2: '你好，查詢結果如下。', 3: '你好，多謝你嘅查詢。'}.get(greeting_id, opening)
+                audit.record('model_response',{'selected_opening':opening})
             except (ValueError, TypeError, AttributeError):
                 pass  # Fixed safe greeting; never render unvalidated model text.
             actual_provider = 'deepseek'
         reply = opening + '\n' + calendar.render_customer_reply(result)
+        audit.record('selection',{'reply':reply,'candidate_count':len(result['slots']),
+            'total_candidates':result.get('total_candidates',0),
+            'rule':'成交規劃：第一個候選加不同日期週末替代；其他查詢最多三個候選',
+            'requires_review':True})
         update_job(j, provider=actual_provider, intent=understanding['intent'] if understanding else 'inspection', reply=reply, stage=3)
         with db() as c:
             event(c, j['id'], 'calendar_checked', 'Google日曆查詢完成；候選時段未建立預約' if result['source'] == 'google' else '資料不足；未查Google日曆，請先確認查詢條件')
@@ -338,6 +379,13 @@ async def deliver(j, reply):
 async def process_one():
     j=claim_job()
     if not j: return False
+    run,context=audit.begin('job',j['id'],j['attempts'])
+    audit.record('input',{'masked_message':j['message'],'mode':j['mode'],
+        'contact_ref':hashlib.sha256(j['contact_id'].encode()).hexdigest()[:12],
+        'manual_schedule':json.loads(j['schedule']) if j.get('schedule') else None,
+        'reset_context':bool(j.get('reset_context'))})
+    audit.save(db,run,DB)
+    audit.watch(run,lambda:audit.save(db,run,DB))
     try:
         reply=await answer(j)
         await deliver(j,reply)
@@ -345,12 +393,24 @@ async def process_one():
         # Do not persist raw provider bodies/headers: these can contain secrets.
         update_job(j,status="failed",error=str(exc) if isinstance(exc, calendar.CalendarError) else "測試故障，或外部服務呼叫失敗（"+type(exc).__name__+"）")
         with db() as c: event(c,j['id'],"failed","處理失敗；可人工重試，尚未發送")
+    finally:
+        try:
+            with db() as c:
+                row=dict(c.execute('SELECT status,reply,error,intent,provider,claim FROM jobs WHERE id=?',(j['id'],)).fetchone())
+            owner=row.pop('claim')
+            if owner!=j['claim']: row={'status':'superseded','error':'租約已失效，不能將其他Worker的結果當成本次執行結果'}
+            audit.record('result',row)
+            audit.save(db,run,DB,status='interrupted' if row['status']=='processing' else row['status'])
+        finally:
+            audit.close(run,context)
     return True
 
 
 async def worker_loop():
     while True:
-        if not await process_one(): await asyncio.sleep(0.5)
+        processed=await process_one()
+        notified=await audit.send_one(db)
+        if not processed and not notified: await asyncio.sleep(0.5)
 
 
 @asynccontextmanager
@@ -379,7 +439,9 @@ def config():
     return {"storage":"SQLite WAL","worker":"embedded" if os.getenv('EMBEDDED_WORKER')=='true' else "separate process",
         "ai_provider":"deepseek" if os.getenv('DEEPSEEK_API_KEY') and os.getenv('AI_PROVIDER')=='deepseek' else "mock",
         "live_send":os.getenv('LIVE_SEND_ENABLED','false')=='true',"calendar":"Google Calendar 唯讀（未驗證連線）" if calendar.mode()=="google" else "固定測試空位",
-        "calendar_config":calendar.safe_config(),"allowlist_count":len(ALLOWLIST)}
+        "calendar_config":calendar.safe_config(),"allowlist_count":len(ALLOWLIST),
+        "audit_email":{"enabled":os.getenv('AUDIT_EMAIL_ENABLED','false').lower()=='true',
+            "configured":bool(os.getenv('SMTP_USER') and os.getenv('SMTP_PASSWORD') and os.getenv('SMTP_FROM') and os.getenv('ADMIN_EMAIL_TO'))}}
 
 
 @app.post('/api/test/messages',dependencies=[Depends(admin)])
@@ -396,15 +458,77 @@ class InterpretInput(BaseModel):
 
 @app.post('/api/intent/interpret',dependencies=[Depends(admin)])
 async def interpret_message(body:InterpretInput):
-    return await understand(body.message,body.contact_id,reset_context=body.reset_context)
+    return await preview_audit('intent_preview',lambda:understand(body.message,body.contact_id,reset_context=body.reset_context),redact(body.message))
 
 
 @app.post('/api/calendar/availability', dependencies=[Depends(admin)])
 async def calendar_availability(body: calendar.AvailabilityRequest):
     try:
-        return await calendar.lookup(body)
+        return await preview_audit('calendar_preview',lambda:calendar.lookup(body))
     except calendar.CalendarError as exc:
         raise HTTPException(503, str(exc)) from None
+
+
+async def preview_audit(kind, action, masked_message=None):
+    run,context=audit.begin(kind)
+    audit.save(db,run,DB)
+    audit.watch(run,lambda:audit.save(db,run,DB))
+    try:
+        if masked_message: audit.record('input',{'masked_message':masked_message,'mode':kind})
+        result=await action()
+        audit.record('result',result)
+        audit.save(db,run,DB,status='ok')
+        return {**result,'audit_run_id':run['id']}
+    except Exception as exc:
+        audit.record('result',{'error':str(exc) if isinstance(exc,calendar.CalendarError) else type(exc).__name__})
+        audit.save(db,run,DB,status='failed')
+        raise
+    finally: audit.close(run,context)
+
+
+@app.get('/api/audit/runs',dependencies=[Depends(admin)])
+def audit_runs():
+    with db() as c:
+        return {'runs':[dict(r) for r in c.execute('SELECT id,job_id,attempt,kind,created,status,mail_state,mail_error,file_error FROM audit_runs ORDER BY rowid DESC LIMIT 100')]}
+
+
+@app.get('/api/audit/runs/{run_id}',dependencies=[Depends(admin)])
+def audit_run(run_id:str,format:str='text'):
+    with db() as c:
+        row=c.execute('SELECT * FROM audit_runs WHERE id=?',(run_id,)).fetchone()
+    if not row: raise HTTPException(404,'No audit report for this run')
+    data=json.loads(row['data'])
+    if format=='json': return data
+    if format=='eml':
+        try: draft=audit.message(data).as_string()
+        except ValueError: raise HTTPException(503,'請先配置SMTP_FROM及ADMIN_EMAIL_TO') from None
+        return PlainTextResponse(draft,media_type='message/rfc822')
+    return PlainTextResponse(audit.summary(data))
+
+
+@app.post('/api/audit/runs/{run_id}/retry-email',dependencies=[Depends(admin)])
+def retry_audit_email(run_id:str):
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        row=c.execute('SELECT mail_state,kind FROM audit_runs WHERE id=?',(run_id,)).fetchone()
+        if not row: raise HTTPException(404,'No audit run')
+        if row['kind']!='job' or row['mail_state']!='config_error':
+            raise HTTPException(409,'Only unsent configuration errors can be retried; verify unknown sends in inbox')
+        c.execute("UPDATE audit_runs SET mail_state='pending',mail_error=NULL WHERE id=?",(run_id,))
+    return {'ok':True}
+
+
+@app.post('/api/audit/test-email',dependencies=[Depends(admin)])
+def test_audit_email():
+    if os.getenv('AUDIT_EMAIL_ENABLED','false').lower()!='true':
+        raise HTTPException(409,'請先在.env啟用AUDIT_EMAIL_ENABLED並重啟API及Worker')
+    run,context=audit.begin('job','notification-check')
+    try:
+        audit.record('input',{'masked_message':'管理員郵件設定測試，沒有客人資料。','mode':'notification-check'})
+        audit.record('result',{'status':'simulated','reply':'此郵件只驗證管理員通知設定，不建立或發送WhatsApp訊息。'})
+        audit.save(db,run,DB,status='simulated')
+        return {'audit_run_id':run['id'],'mail_state':'pending'}
+    finally: audit.close(run,context)
 
 
 @app.post('/webhooks/sleekflow')
@@ -448,6 +572,7 @@ def jobs():
             item.pop('claim',None)
             for name in ('schedule', 'calendar_result', 'understanding', 'resolved_schedule'):
                 item[name] = json.loads(item[name]) if item.get(name) else None
+            item['audit_runs']=[dict(a) for a in c.execute('SELECT id,attempt,status,mail_state,mail_error,file_error FROM audit_runs WHERE job_id=? ORDER BY rowid DESC',(r['id'],))]
             result.append(item)
         return {"jobs":result}
 
@@ -472,6 +597,7 @@ class Takeover(BaseModel):
 
 @app.post('/api/contacts/{contact_id}/takeover',dependencies=[Depends(admin)])
 def takeover(contact_id:str,body:Takeover):
+    interrupted=[]
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
         c.execute("INSERT OR IGNORE INTO contacts(id) VALUES(?)",(contact_id,))
@@ -481,6 +607,8 @@ def takeover(contact_id:str,body:Takeover):
             for row in c.execute("SELECT id FROM jobs WHERE contact_id=? AND status='queued'",(contact_id,)).fetchall():
                 c.execute("UPDATE jobs SET status='handoff',updated=? WHERE id=?",(time.time(),row['id']))
                 event(c,row['id'],"handoff","人工接管；取消待處理任務")
+                interrupted.append(row['id'])
+    for job_id in interrupted: audit_terminal_job(job_id)
     return {"ok":True,"human":body.human}
 
 

@@ -12,6 +12,7 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 from backend import calendar_service as cal
+from backend import audit_service as audit
 
 PICKUP = r'領匙|領鎖匙|攞鎖匙|攞匙|取鑰匙|取鎖匙|拿鑰匙|拿鎖匙|拎鎖匙|拎匙|收樓'
 DATE = re.compile(r'\d{4}[-/]\d{1,2}[-/]\d{1,2}|(?:\d{4}年)?\d{1,2}月\d{1,2}[日號号]?|\d{1,2}/\d{1,2}|(?:下個月|本月|今個月)\d{1,2}[日號号]|(?:下個|今個|下|本)?(?:星期|禮拜|週|周)[一二三四五六日天]|今日|今天|明日|明天|聽日|後日|後天|(?:下個|今個|下|本)?(?:週末|周末)')
@@ -120,6 +121,8 @@ async def extract(text):
               '四個日期時間欄位只能逐字抄錄原訊息片段，例如11月5日、下星期二、上午11點；不能換算日期、猜年份或補資料。'
               '領匙/攞鎖匙/收樓屬pickup，成交屬completion，想約驗樓日期屬inspection。無資料填null。')
     try:
+        audit.record('model_request',{'purpose':'意圖及原文片段提取','model':os.getenv('DEEPSEEK_MODEL','deepseek-flash'),
+                                     'system_prompt':prompt,'masked_message':text})
         async with httpx.AsyncClient(timeout=25) as client:
             response = await client.post('https://api.deepseek.com/chat/completions',
                 headers={'Authorization':'Bearer '+os.environ['DEEPSEEK_API_KEY']},
@@ -128,6 +131,7 @@ async def extract(text):
                       'response_format':{'type':'json_object'},'max_tokens':700,'stream':False})
             response.raise_for_status()
             spans = Spans.model_validate_json(response.json()['choices'][0]['message']['content'])
+        model_fields=spans.model_dump()
         for field in ('pickup_date','pickup_time','inspection_date','completion_date'):
             value = getattr(spans,field)
             if value and (value not in text or not (TIME.fullmatch(value) if field=='pickup_time' else DATE.fullmatch(value))):
@@ -135,8 +139,10 @@ async def extract(text):
             # Explicit local extraction wins if the model omits a known field.
             if getattr(fallback,field): setattr(spans,field,getattr(fallback,field))
         if fallback.intent != 'unclear': spans.intent = fallback.intent
+        audit.record('model_response',{'validated_model_fields':model_fields})
         return spans, 'deepseek', []
     except Exception:
+        audit.record('model_failure',{'action':'本地規則備援；不保存未核對模型內容或原始錯誤'})
         return fallback, 'rules', ['模型提取未成功或回應未通過核對；已用本地規則識別，不採用模型猜測。']
 
 

@@ -2,6 +2,10 @@
 
 可執行的 Python FastAPI + SQLite + 獨立背景 Worker，以及繁體中文工作台。
 
+## 執行日誌與管理員通知
+
+每次任務及重試保存輸入、意圖、查詢條件、Google忙碌區間、逐場排除原因及回覆。工作台可讀中文報告及下載JSON；配置SMTP後可每次寄管理員通知。詳見[日誌與郵件設定](docs/AUDIT_AND_ADMIN_EMAIL.md)。郵件預設關閉，WhatsApp設定獨立。
+
 ## 自動識別與Google Calendar
 
 Google模式下可直接輸入客人訊息，自動識別意圖並回填查詢條件；成交日先查空位再倒推領匙建議。操作、已支援句式、工作天假設及測試樣本見[意圖識別與規劃指南](docs/INTENT_AND_PLANNING.md)。

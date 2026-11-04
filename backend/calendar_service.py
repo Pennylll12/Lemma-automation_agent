@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic import BaseModel, Field, field_validator
+from backend import audit_service as audit
 
 HK = ZoneInfo('Asia/Hong_Kong')
 STARTS = ('09:00', '12:30', '15:45', '18:00')
@@ -111,6 +112,7 @@ async def fetch_busy(start, end):
                 json={'timeMin': start.isoformat(), 'timeMax': end.isoformat(),
                       'timeZone': 'Asia/Hong_Kong', 'items': [{'id': calendar_id()}]},
             )
+        audit.record('calendar_http',{'status':response.status_code})
         if response.status_code != 200:
             code = response.status_code
             raise CalendarError(f'Google日曆查詢失敗（HTTP {code}）；請檢查Calendar API、分享權限、配額及網絡。')
@@ -189,12 +191,14 @@ def completion_window(completion):
 
 
 async def lookup(request: AvailabilityRequest):
+    audit.record('query',request.model_dump(mode='json'))
     current = now_hk()
     if request.start_date < current.date() or request.start_date > current.date() + timedelta(days=366):
         raise CalendarError('請選擇今天起一年內的查詢開始日期。')
     planning = None
     if request.completion_date and not request.pickup_at and request.plan_from_completion:
         planning, workday = completion_window(request.completion_date)
+        audit.record('planning',planning)
         first = max(current.date(), date.fromisoformat(planning['earliest_pickup']), request.start_date)
         deadline = date.fromisoformat(planning['pickup_deadline'])
         if first > deadline:
@@ -225,7 +229,11 @@ async def lookup(request: AvailabilityRequest):
     except (ValueError, TypeError):
         raise CalendarError('用餐／交通設定不正確；用餐需兩段各30–50分鐘，交通需0–180分鐘。') from None
     # Include adjacent days so busy intervals just outside the range retain buffers.
+    audit.record('calendar_request',{'calendar_id':calendar_id(),'timezone':'Asia/Hong_Kong',
+        'timeMin':start-timedelta(days=1),'timeMax':end+timedelta(days=1),
+        'effective_query':request.model_dump(mode='json')})
     busy = await fetch_busy(start - timedelta(days=1), end + timedelta(days=1))
+    audit.record('busy',{'calendar_id':calendar_id(),'intervals':[{'start':a,'end':b} for a,b in busy]})
     padded = [(a-timedelta(minutes=travel or 0), b+timedelta(minutes=travel or 0)) for a,b in busy]
     notes = ['只查日曆忙碌區間，沒有建立或保留預約；多人容量及當日完整行程需人工確認。',
              '候選時段是替代選項，並非可同時全部安排；重疊場次必須轉人工。']
@@ -237,23 +245,43 @@ async def lookup(request: AvailabilityRequest):
         notes.append('午晚飯尚未配置，須另預留各30–50分鐘，不能直接排滿。')
     if not request.pickup_at:
         notes.append('未提供領匙時間，無法核對領匙後1小時規則。')
+    audit.record('policy',{'starts':STARTS,'duration_minutes':request.duration_minutes,
+        'preference':request.preference,'weekend_only':request.weekend_only,
+        'weekday_evening':request.include_weekday_evening,'travel_minutes':travel,
+        'meal_breaks':os.getenv('CALENDAR_MEAL_BREAKS',''),'pickup_buffer_minutes':60})
     slots = []
+    decisions = []
     for offset in range(request.days):
         day = request.start_date + timedelta(days=offset)
-        if request.weekend_only and day.weekday() < 5: continue
         for hhmm in STARTS:
-            if hhmm == '18:00' and day.weekday() < 5 and not request.include_weekday_evening:
-                continue
-            if request.preference == 'morning' and hhmm != '09:00':
-                continue
-            if request.preference == 'afternoon' and hhmm == '09:00':
-                continue
-            if request.preference == 'evening' and hhmm != '18:00': continue
             a = datetime.combine(day, time.fromisoformat(hhmm), HK)
             b = a + timedelta(minutes=request.duration_minutes)
-            if a <= current or (request.pickup_at and a < request.pickup_at + timedelta(hours=1)):
+            decision={'start':a.isoformat(),'end':b.isoformat(),'reason':'available'}
+            decisions.append(decision)
+            if request.weekend_only and day.weekday() < 5:
+                decision['reason']='weekend_only';continue
+            if hhmm == '18:00' and day.weekday() < 5 and not request.include_weekday_evening:
+                decision['reason']='weekday_evening'
                 continue
-            if conflicts(a, b, padded) or conflicts(a, b, meal_breaks(day)):
+            if request.preference == 'morning' and hhmm != '09:00':
+                decision['reason']='preference'
+                continue
+            if request.preference == 'afternoon' and hhmm == '09:00':
+                decision['reason']='preference'
+                continue
+            if request.preference == 'evening' and hhmm != '18:00':
+                decision['reason']='preference';continue
+            if a <= current:
+                decision['reason']='past';continue
+            if request.pickup_at and a < request.pickup_at + timedelta(hours=1):
+                decision['reason']='pickup_buffer'
+                continue
+            if conflicts(a, b, padded):
+                decision['reason']='busy'
+                decision['conflicts']=[{'start':x.isoformat(),'end':y.isoformat()} for x,y in padded if a<y and b>x]
+                continue
+            if conflicts(a, b, meal_breaks(day)):
+                decision['reason']='meal'
                 continue
             pickup_plan = None
             if planning:
@@ -261,7 +289,8 @@ async def lookup(request: AvailabilityRequest):
                 # A morning inspection cannot assume management opens at 08:00.
                 if pickup_day == day and a.hour < 12: pickup_day -= timedelta(days=1)
                 while not workday(pickup_day): pickup_day -= timedelta(days=1)
-                if pickup_day < date.fromisoformat(planning['earliest_pickup']) or pickup_day < current.date(): continue
+                if pickup_day < date.fromisoformat(planning['earliest_pickup']) or pickup_day < current.date():
+                    decision['reason']='pickup_window';continue
                 pickup_plan = {'date':pickup_day.isoformat(),
                                'latest_time':(a-timedelta(hours=1)).strftime('%H:%M') if pickup_day==day else None,
                                'same_day':pickup_day==day,'confirmed':False}
@@ -272,6 +301,7 @@ async def lookup(request: AvailabilityRequest):
                           'evening': hhmm == '18:00', 'requires_review': True,
                           **({'pickup_suggestion':pickup_plan} if pickup_plan else {})})
     slots.sort(key=lambda s: (False if planning else not s['preferred'], s['start']))
+    audit.record('candidates',decisions)
     return {'status': 'candidates' if slots else 'no_slots', 'source': 'google',
             'calendar_id': calendar_id(), 'timezone': 'Asia/Hong_Kong',
             'checked_at': current.isoformat(), 'duration_minutes': request.duration_minutes,
